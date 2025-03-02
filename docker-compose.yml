@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  flask_app:
+    build: .
+    ports:
+      - "5000:5000"
+    restart: always
+    depends_on:
+      - xbee_listener
+
+  xbee_listener:
+    build: .
+    command: python xbreemw.py
+    restart: always
