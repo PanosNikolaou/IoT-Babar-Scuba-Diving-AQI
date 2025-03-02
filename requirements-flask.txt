@@ -5,3 +5,4 @@ Flask-Limiter
 requests
 pandas
 numpy
+pyserial

@@ -3,7 +3,7 @@ import requests
 import json
 
 # Serial port settings for the XBee
-PORT = "/dev/ttyUSB2"  # Replace with your XBee's port (e.g., COM3 on Windows, /dev/ttyUSB0 on Linux)
+PORT = "/dev/ttyUSB0"  # Replace with your XBee's port (e.g., COM3 on Windows, /dev/ttyUSB0 on Linux)
 BAUD_RATE = 9600
 
 # Flask API endpoint
