@@ -1,0 +1,18 @@
+# Use Python 3.11 for latest support
+FROM python:3.11
+
+# Set the working directory inside the container
+WORKDIR /app
+
+# Copy only the necessary dependencies file
+COPY requirements-xbee.txt .
+
+# Upgrade pip and install dependencies
+RUN pip install --no-cache-dir --upgrade pip
+RUN pip install --no-cache-dir -r requirements-xbee.txt
+
+# Copy the rest of the XBee application files
+COPY . .
+
+# Run the XBee listener script
+CMD ["python", "xbreemw.py"]

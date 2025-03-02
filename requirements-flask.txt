@@ -1,0 +1,7 @@
+Flask
+Flask-SQLAlchemy
+Gunicorn
+Flask-Limiter
+requests
+pandas
+numpy
