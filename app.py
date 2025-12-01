@@ -1,8 +1,7 @@
-import json
 import time
 import threading
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 import traceback
 
@@ -23,7 +22,7 @@ DB_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), 'instance', 'i
 try:
     # Ensure the instance directory exists so SQLite can create/open the DB file
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-except Exception as _:
+except Exception:
     # non-fatal: if we can't create it here we'll let SQLAlchemy report the error
     pass
 app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{DB_FILE}"
@@ -79,6 +78,7 @@ try:
         import subprocess, sys
         migrate_script = os.path.join(os.path.dirname(__file__), 'scripts', 'migrate_db.py')
         marker = os.path.join(os.path.dirname(__file__), '.migration_done')
+
         # If we've already run migration in this workspace, do a quick verification
         # that the expected columns exist. If they don't, run migration again.
         def _needs_migration(marker_path, db_path):
@@ -119,7 +119,7 @@ try:
     else:
         # In the reloader parent process, skip migration to avoid duplicate backups/logs
         print('Skipping DB migration in reloader parent process')
-except Exception as e:
+except Exception:
     # Non-fatal: log and continue; create_all() will still try to create missing tables
     print('Migration script failed or not run:')
     print(traceback.format_exc())
@@ -140,7 +140,7 @@ with app.app_context():
             print('db.engine.url: not available yet')
     except Exception as _:
         pass
-    db.create_all()
+        print(traceback.format_exc())
 
     # Ensure the uuid, sd_aqi and sd_aqi_level columns exist in existing SQLite tables; if not, add them.
     # Use a raw sqlite connection for robustness and commit immediately.
@@ -240,7 +240,7 @@ with app.app_context():
                 for (rid,) in rows:
                     cur.execute("UPDATE sensor_data SET uuid = ? WHERE id = ?", (str(uuid4()), rid))
                 conn.commit()
-            except Exception as inner_e:
+            except Exception:
                 try:
                     conn.rollback()
                 except Exception:
@@ -261,7 +261,7 @@ with app.app_context():
                 for (rid,) in rows:
                     cur.execute("UPDATE mq_sensor_data SET uuid = ? WHERE id = ?", (str(uuid4()), rid))
                 conn.commit()
-            except Exception as inner_e:
+            except Exception:
                 try:
                     conn.rollback()
                 except Exception:
@@ -285,19 +285,61 @@ def receive_data():
         if not data:
             return jsonify({"status": "error", "message": "No JSON data received"}), 400
 
-        # If the payload includes a 'timestamp' field (ISO string), try to parse it
+        # If the payload includes a 'timestamp' field (ISO string) or epoch ms, try to parse it
         parsed_ts = None
         if isinstance(data, dict):
-            ts_val = data.get('timestamp') or data.get('timestamp_ms')
+            ts_val = data.get('timestamp')
+            if ts_val is None:
+                ts_val = data.get('timestamp_ms') or data.get('ts')
             if ts_val:
                 try:
-                    # If timestamp is millis (timestamp_ms) it will be numeric; otherwise expect ISO
-                    if isinstance(ts_val, (int, float)):
-                        # fallback: use server time when only millis provided
-                        parsed_ts = datetime.utcnow()
+                    # helper to parse various timestamp formats into an aware UTC datetime
+                    def _parse_to_utc(val):
+                        # numeric epoch (seconds or milliseconds)
+                        if isinstance(val, (int, float)):
+                            v = float(val)
+                            # heuristic: values > 1e12 are milliseconds
+                            if v > 1e12:
+                                return datetime.fromtimestamp(v / 1000.0, tz=timezone.utc)
+                            else:
+                                return datetime.fromtimestamp(v, tz=timezone.utc)
+
+                        s = str(val)
+                        # strip whitespace
+                        s = s.strip()
+                        # If it ends with Z (UTC) remove it and parse, then set tzinfo=UTC
+                        try:
+                            if s.endswith('Z'):
+                                no_z = s[:-1]
+                                dt = datetime.fromisoformat(no_z)
+                                if dt.tzinfo is None:
+                                    return dt.replace(tzinfo=timezone.utc)
+                                return dt.astimezone(timezone.utc)
+                            else:
+                                dt = datetime.fromisoformat(s)
+                                if dt.tzinfo is None:
+                                    return dt.replace(tzinfo=timezone.utc)
+                                return dt.astimezone(timezone.utc)
+                        except Exception:
+                            # best-effort: try parsing common formats
+                            try:
+                                # fallback to parsing with space-separated date/time
+                                dt = datetime.strptime(s, '%Y-%m-%d %H:%M:%S')
+                                return dt.replace(tzinfo=timezone.utc)
+                            except Exception:
+                                return None
+
+                    parsed_dt = _parse_to_utc(ts_val)
+                    if parsed_dt is not None:
+                        now = datetime.now(timezone.utc)
+                        # Clamp timestamps that are far in the future ( > now + 5 minutes )
+                        if parsed_dt > now + timedelta(minutes=5):
+                            app.logger.warning("Incoming timestamp far in future: %s. Clamping to now.", ts_val)
+                            parsed_dt = now
+                        # store as naive UTC (consistent with existing DB rows)
+                        parsed_ts = parsed_dt.astimezone(timezone.utc).replace(tzinfo=None)
                     else:
-                        # try parsing ISO formatted timestamp
-                        parsed_ts = datetime.fromisoformat(str(ts_val))
+                        parsed_ts = None
                 except Exception:
                     parsed_ts = None
 
@@ -402,6 +444,7 @@ def get_data():
         return jsonify({
             "general_data": general_data,
             "mq_data": mq_data,
+            "server_now": datetime.now(timezone.utc).isoformat(),
             "general_total": len(general_data),       # Total valid records for general sensor data
             "mq_total": mq_pagination.total,         # Total records for MQ sensor data
             "page": pagination.page,                 # Current page
@@ -490,7 +533,7 @@ def get_mq_data():
             "Air": r.air
         } for r in mq_records]
 
-        return jsonify({"mq_data": mq_data}), 200
+        return jsonify({"mq_data": mq_data, "server_now": datetime.now(timezone.utc).isoformat()}), 200
     except OperationalError as oe:
         # Try running migration + disposing engine/session and retry once
         try:
@@ -545,7 +588,7 @@ def get_mq_data():
                     "H2": r.h2,
                     "Air": r.air
                 } for r in mq_records]
-                return jsonify({"mq_data": mq_data}), 200
+                return jsonify({"mq_data": mq_data, "server_now": datetime.now(timezone.utc).isoformat()}), 200
         except Exception:
             pass
         print("Error:", str(oe))

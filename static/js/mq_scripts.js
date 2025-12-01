@@ -178,18 +178,37 @@ async function fetchMqData() {
             const prev = sortedFiltered.length > 1 ? sortedFiltered[1] : null;
             renderMqSummary(latest, prev);
             // Update visible server timestamp indicator and flash if new
-            try {
-                if (latest.timestamp) {
-                    if (latest.timestamp !== lastServerTimestamp) {
-                        lastServerTimestamp = latest.timestamp;
-                        updateServerTimestampDisplay(latest.timestamp);
+                try {
+                    // If API returns server_now, display server 'now' and latest data timestamp together.
+                    const serverNowIso = result.server_now;
+                    const latestTs = latest.timestamp;
+                    const el = document.getElementById('server-latest-ts');
+                    if (el) {
+                        let serverNowDisp = serverNowIso ? parseServerTimestamp(serverNowIso).toLocaleString() : null;
+                        let latestDisp = latestTs ? parseServerTimestamp(latestTs).toLocaleString() : null;
+                        if (serverNowDisp && latestDisp) {
+                            el.innerText = `Server: ${serverNowDisp} (latest data: ${latestDisp})`;
+                        } else if (serverNowDisp) {
+                            el.innerText = `Server: ${serverNowDisp}`;
+                        } else if (latestDisp) {
+                            el.innerText = `Server: ${latestDisp}`;
+                        }
+                        // visual flash
+                        el.classList.add('bg-success');
+                        el.classList.add('text-white');
+                        setTimeout(() => { el.classList.remove('bg-success'); el.classList.remove('text-white'); }, 900);
                     }
-                    // also update the last-updated helper (use parseServerTimestamp for consistent parsing)
-                    if (typeof window.__updateLastUpdated === 'function') {
-                        window.__updateLastUpdated(parseServerTimestamp(latest.timestamp).toLocaleString());
+
+                    if (latest.timestamp) {
+                        if (latest.timestamp !== lastServerTimestamp) {
+                            lastServerTimestamp = latest.timestamp;
+                        }
+                        // also update the last-updated helper (use parseServerTimestamp for consistent parsing)
+                        if (typeof window.__updateLastUpdated === 'function') {
+                            window.__updateLastUpdated(parseServerTimestamp(latest.timestamp).toLocaleString());
+                        }
                     }
-                }
-            } catch (e) { console.warn('server timestamp update error', e); }
+                } catch (e) { console.warn('server timestamp update error', e); }
         }
 
         // Update the chart (chart update function will handle internal ordering/limiting)
