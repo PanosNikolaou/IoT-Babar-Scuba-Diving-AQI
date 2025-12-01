@@ -119,7 +119,7 @@ try:
         print('Skipping DB migration in reloader parent process')
 except Exception as e:
     # Non-fatal: log and continue; create_all() will still try to create missing tables
-    print('Migration script failed or not run:', e)
+    print('Migration script failed or not run:', repr(e))
 
 # Create the database tables
 with app.app_context():
@@ -181,7 +181,7 @@ with app.app_context():
             pass
     except Exception as e:
         # Non-fatal: if this fails (e.g., non-sqlite engine), log and continue; new DBs will include the columns.
-        print('Warning ensuring schema columns:', e)
+        print('Warning ensuring schema columns:', repr(e))
     # Determine which columns actually exist in the tables so we can avoid referencing missing columns
     SENSOR_COLUMNS = set()
     MQ_COLUMNS = set()
