@@ -37,6 +37,9 @@
                 <li class="nav-item">
                     <a class="nav-link" href="/evaluation">Evaluation</a>
                 </li>
+                <li class="nav-item d-flex align-items-center">
+                    <span id="server-latest-ts" class="nav-link text-light" style="cursor:default">Server: —</span>
+                </li>
             </ul>
         </div>
     </div>
@@ -185,7 +188,8 @@
                         <div class="mb-2">
                             <label class="form-label">Polling</label>
                             <div class="d-flex align-items-center">
-                                <button id="poll-toggle" class="btn btn-sm btn-success me-2">Pause</button>
+                                    <button id="poll-toggle" class="btn btn-sm btn-success me-2">Pause</button>
+                                    <button id="refresh-now" class="btn btn-sm btn-outline-info me-2">Refresh Now</button>
                                 <label class="me-2">Interval (ms)</label>
                                 <input id="poll-interval" type="number" class="form-control form-control-sm" value="1000" min="200" style="width:110px">
                             </div>

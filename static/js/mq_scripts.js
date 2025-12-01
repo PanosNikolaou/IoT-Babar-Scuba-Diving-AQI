@@ -71,6 +71,54 @@ document.getElementById('applyFilter').addEventListener('click', () => {
 });
 
 let mqData = []; // Global variable to store MQ sensor data
+let lastServerTimestamp = null;
+
+function updateServerTimestampDisplay(ts) {
+    try {
+        const el = document.getElementById('server-latest-ts');
+        if (!el) return;
+        // Format ts to local string if it's a parseable date
+        let disp = ts;
+        try {
+            const d = parseServerTimestamp(ts);
+            if (!isNaN(d.getTime())) disp = d.toLocaleString();
+        } catch (e) {}
+        el.innerText = `Server: ${disp}`;
+        // flash highlight when changed
+        el.classList.add('bg-success');
+        el.classList.add('text-white');
+        setTimeout(() => {
+            el.classList.remove('bg-success');
+            el.classList.remove('text-white');
+        }, 900);
+    } catch (e) {
+        console.warn('updateServerTimestampDisplay error', e);
+    }
+}
+
+// Parse server timestamp consistently. Many servers emit naive ISO strings
+// (e.g. "2025-12-01T20:50:30") without a timezone. Different browsers
+// sometimes interpret these as local or UTC inconsistently. To make
+// ordering and display consistent, treat naive ISO timestamps as UTC by
+// appending a 'Z' when no timezone is present.
+function parseServerTimestamp(ts) {
+    if (!ts) return null;
+    try {
+        // If already contains timezone info (Z or +/-) leave as-is
+        if (/[zZ]|[+-]\d\d:?\d\d$/.test(ts)) {
+            return new Date(ts);
+        }
+        // If it looks like an ISO datetime without timezone, append 'Z' to
+        // force UTC parsing and avoid inconsistent local interpretation.
+        if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(ts)) {
+            return new Date(ts + 'Z');
+        }
+        // fallback
+        return new Date(ts);
+    } catch (e) {
+        return new Date(ts);
+    }
+}
 
 async function fetchMqData() {
     try {
@@ -111,7 +159,7 @@ async function fetchMqData() {
         const fallbackEl = document.getElementById('fallback-hint');
         if (fallbackEl) {
             if (usingFallback) {
-                const latestTs = new Date(mqData[0].timestamp).toLocaleString();
+                const latestTs = parseServerTimestamp(mqData[0].timestamp).toLocaleString();
                 fallbackEl.style.display = 'block';
                 fallbackEl.innerHTML = `<div class="alert alert-warning p-1 m-0">Showing latest available data (latest record: ${latestTs}), which is older than the selected filter.</div>`;
             } else {
@@ -121,7 +169,7 @@ async function fetchMqData() {
         }
 
         // Sort usedData newest-first for chart/table/analysis and save for row click lookup
-        const sortedFiltered = usedData.slice().sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+        const sortedFiltered = usedData.slice().sort((a, b) => parseServerTimestamp(b.timestamp) - parseServerTimestamp(a.timestamp));
         lastFilteredData = sortedFiltered.slice();
 
         // Render summary now that we have the sorted dataset (pass previous record for deltas)
@@ -129,6 +177,19 @@ async function fetchMqData() {
             const latest = sortedFiltered[0];
             const prev = sortedFiltered.length > 1 ? sortedFiltered[1] : null;
             renderMqSummary(latest, prev);
+            // Update visible server timestamp indicator and flash if new
+            try {
+                if (latest.timestamp) {
+                    if (latest.timestamp !== lastServerTimestamp) {
+                        lastServerTimestamp = latest.timestamp;
+                        updateServerTimestampDisplay(latest.timestamp);
+                    }
+                    // also update the last-updated helper (use parseServerTimestamp for consistent parsing)
+                    if (typeof window.__updateLastUpdated === 'function') {
+                        window.__updateLastUpdated(parseServerTimestamp(latest.timestamp).toLocaleString());
+                    }
+                }
+            } catch (e) { console.warn('server timestamp update error', e); }
         }
 
         // Update the chart (chart update function will handle internal ordering/limiting)
@@ -140,9 +201,14 @@ async function fetchMqData() {
         // Compute and render analysis cards
         computeAndRenderAnalysis(sortedFiltered);
 
-        // Update last-updated timestamp
+        // Update last-updated timestamp only if server timestamp not available
+        // If we have a latest server timestamp, __updateLastUpdated was already set above.
         if (typeof window.__updateLastUpdated === 'function') {
-            window.__updateLastUpdated(new Date().toLocaleString());
+            if (!lastServerTimestamp) {
+                window.__updateLastUpdated(new Date().toLocaleString());
+            } else {
+                window.__updateLastUpdated(parseServerTimestamp(lastServerTimestamp).toLocaleString());
+            }
         }
     } catch (error) {
         console.error('Error fetching MQ data:', error);
@@ -198,7 +264,7 @@ function renderMqSummary(record, prev) {
     if (recordedEl) {
         if (record.timestamp) {
             try {
-                recordedEl.innerText = new Date(record.timestamp).toLocaleString();
+                recordedEl.innerText = parseServerTimestamp(record.timestamp).toLocaleString();
             } catch (e) {
                 recordedEl.innerText = String(record.timestamp);
             }
@@ -297,18 +363,18 @@ function filterDataByCriteria(data) {
 
     if (activeFilter === '1hour') {
         const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
-        filteredData = data.filter(record => new Date(record.timestamp) >= oneHourAgo);
+        filteredData = data.filter(record => parseServerTimestamp(record.timestamp) >= oneHourAgo);
     } else if (activeFilter === '24hours') {
         const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-        filteredData = data.filter(record => new Date(record.timestamp) >= oneDayAgo);
+        filteredData = data.filter(record => parseServerTimestamp(record.timestamp) >= oneDayAgo);
     } else if (activeFilter === '7days') {
         const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-        filteredData = data.filter(record => new Date(record.timestamp) >= sevenDaysAgo);
+        filteredData = data.filter(record => parseServerTimestamp(record.timestamp) >= sevenDaysAgo);
     } else if (activeFilter === 'custom') {
         const startDate = new Date(document.getElementById('startDate').value);
         const endDate = new Date(document.getElementById('endDate').value);
         filteredData = data.filter(record => {
-            const recordDate = new Date(record.timestamp);
+            const recordDate = parseServerTimestamp(record.timestamp);
             return recordDate >= startDate && recordDate <= endDate;
         });
     }
@@ -320,10 +386,10 @@ function filterDataByCriteria(data) {
 function updateMqChart(filteredMqData) {
     //const MAX_DATA_POINTS = 50; // Optional: Limit the data points
     const maxDataPoints = parseInt(document.getElementById('maxDataPoints').value, 10) || 50;
-    const sortedData = filteredMqData.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    const sortedData = filteredMqData.sort((a, b) => parseServerTimestamp(b.timestamp) - parseServerTimestamp(a.timestamp));
     const limitedData = sortedData.slice(0, maxDataPoints).reverse(); // Get the latest points in chronological order
 
-    const timestamps = limitedData.map(record => new Date(record.timestamp));
+    const timestamps = limitedData.map(record => parseServerTimestamp(record.timestamp));
     mqChart.data.labels = timestamps;
 
     function labelToKey(label) {
@@ -344,6 +410,23 @@ function updateMqChart(filteredMqData) {
             return null;
         });
     });
+
+    // Expose the limited data for quick console inspection in the browser
+    try {
+        // Make an array with newest-first ordering for easier debugging (index 0 = latest)
+        window.lastFetchedMqData = limitedData.slice().reverse();
+
+        // Build ISO timestamps array for logging (chronological order)
+        const parsedIso = timestamps.map(t => (t && t.toISOString) ? t.toISOString() : null);
+
+        // Log concise debug info: chronological timestamps, latest 3 newest-first, and dataset summaries
+        console.log('MQ-debug parsed timestamps (chronological):', parsedIso);
+        console.log('MQ-debug latest 3 parsed timestamps (newest-first):', parsedIso.slice(-3).reverse());
+        console.log('MQ-debug chart datasets:', mqChart.data.datasets.map(ds => ds.label));
+        console.log('MQ-debug dataset summary:', mqChart.data.datasets.map(ds => ({ label: ds.label, len: ds.data.length, first: ds.data[0], last: ds.data[ds.data.length-1] })));
+    } catch (e) {
+        console.warn('MQ-debug logging failed', e);
+    }
 
     mqChart.update();
 }
@@ -439,8 +522,8 @@ document.getElementById('applyFilter').addEventListener('click', () => {
 
     // Filter the global mqData variable
     const filteredData = mqData.filter(record => {
-        const timestamp = new Date(record.timestamp);
-        return (!startDate || timestamp >= startDate) && timestamp <= endDate;
+            const timestamp = parseServerTimestamp(record.timestamp);
+                return (!startDate || timestamp >= startDate) && timestamp <= endDate;
     });
 
     // Limit the data to maxDataPoints
@@ -483,14 +566,15 @@ function renderMqTablePage(data, page) {
     // Use DataTables: build rows array and populate table. Data should be sorted newest-first
     if (!mqDataTable) return; // not initialized yet
 
-    const sorted = data.slice().sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    const sorted = data.slice().sort((a, b) => parseServerTimestamp(b.timestamp) - parseServerTimestamp(a.timestamp));
     const rows = [];
     for (let i = 0; i < sorted.length; i++) {
         const record = sorted[i];
         const prev = (i + 1 < sorted.length) ? sorted[i + 1] : null; // previous in time
         const cells = [];
         // Timestamp (ISO for lookup, but display localized)
-        cells.push(new Date(record.timestamp).toLocaleString());
+        const ts = parseServerTimestamp(record.timestamp);
+        cells.push(ts && !isNaN(ts.getTime()) ? ts.toLocaleString() : (record.timestamp || ''));
         // temperature, humidity
         cells.push((record.temperature !== null && record.temperature !== undefined) ? Number(record.temperature).toFixed(3) + ' ' + deltaHtml(record.temperature, prev ? prev.temperature : null) : 'N/A');
         cells.push((record.humidity !== null && record.humidity !== undefined) ? Number(record.humidity).toFixed(3) + ' ' + deltaHtml(record.humidity, prev ? prev.humidity : null) : 'N/A');
@@ -526,13 +610,14 @@ function updateMqDataTable(data) {
     const tableBody = document.getElementById('mq-data-table-body');
     if (!tableBody) return;
     tableBody.innerHTML = '';
-    const sorted = data.slice().sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    const sorted = data.slice().sort((a, b) => parseServerTimestamp(b.timestamp) - parseServerTimestamp(a.timestamp));
     sorted.forEach((record, i) => {
         const prev = (i + 1 < sorted.length) ? sorted[i + 1] : null;
         const row = document.createElement('tr');
         const sdCell = (record.sd_aqi !== undefined && record.sd_aqi !== null) ? Number(record.sd_aqi).toFixed(3) : (record.SD_AQI !== undefined && record.SD_AQI !== null ? Number(record.SD_AQI).toFixed(3) : 'N/A');
+        const ts = parseServerTimestamp(record.timestamp);
         row.innerHTML = `
-            <td>${new Date(record.timestamp).toLocaleString()}</td>
+            <td>${ts && !isNaN(ts.getTime()) ? ts.toLocaleString() : (record.timestamp || '')}</td>
             <td>${record.temperature !== null && record.temperature !== undefined ? Number(record.temperature).toFixed(3) + ' ' + deltaHtml(record.temperature, prev ? prev.temperature : null) : 'N/A'}</td>
             <td>${record.humidity !== null && record.humidity !== undefined ? Number(record.humidity).toFixed(3) + ' ' + deltaHtml(record.humidity, prev ? prev.humidity : null) : 'N/A'}</td>
             <td>${sdCell}</td>
@@ -640,7 +725,7 @@ function showDetails(record) {
     const modal = new bootstrap.Modal(document.getElementById('detailsModal'));
 
     // Populate modal details
-    document.getElementById('modal-timestamp').innerText = new Date(record.timestamp).toLocaleString();
+    document.getElementById('modal-timestamp').innerText = parseServerTimestamp(record.timestamp).toLocaleString();
     document.getElementById('modal-temperature').innerText = record.temperature !== null ? record.temperature.toFixed(3) : 'N/A';
     document.getElementById('modal-humidity').innerText = record.humidity !== null ? record.humidity.toFixed(3) : 'N/A';
     document.getElementById('modal-lpg').innerText = record.LPG !== null ? record.LPG.toFixed(3) : 'N/A';
@@ -728,6 +813,26 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!isNaN(v) && v >= 200) {
                 pollIntervalMs = v;
                 if (isPolling) startPolling();
+            }
+        });
+    }
+
+    // Manual refresh/debug button: force immediate fetch
+    const refreshBtn = document.getElementById('refresh-now');
+    if (refreshBtn) {
+        refreshBtn.addEventListener('click', async (e) => {
+            try {
+                refreshBtn.disabled = true;
+                const old = refreshBtn.innerText;
+                refreshBtn.innerText = 'Refreshing...';
+                await fetchMqData();
+                // short visual confirmation
+                refreshBtn.innerText = 'Done';
+                setTimeout(() => { refreshBtn.innerText = old; refreshBtn.disabled = false; }, 800);
+            } catch (err) {
+                console.warn('Refresh Now failed', err);
+                refreshBtn.disabled = false;
+                refreshBtn.innerText = 'Refresh Now';
             }
         });
     }

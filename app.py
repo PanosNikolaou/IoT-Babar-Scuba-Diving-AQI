@@ -587,6 +587,41 @@ def _debug_db_info():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/_debug/xbee-status')
+def _debug_xbee_status():
+    try:
+        import xbreemw as xb
+        ser = getattr(xb, 'ser', None)
+        port = None
+        baud = None
+        if ser is not None:
+            try:
+                port = getattr(ser, 'port', None)
+                baud = getattr(ser, 'baudrate', None)
+            except Exception:
+                port = None
+                baud = None
+        recent = []
+        try:
+            recent = list(getattr(xb, 'recent_raw', []))
+        except Exception:
+            recent = []
+        # ensure strings
+        recent_clean = []
+        for item in recent:
+            try:
+                if isinstance(item, bytes):
+                    recent_clean.append(item.decode('utf-8', errors='replace'))
+                else:
+                    recent_clean.append(str(item))
+            except Exception:
+                recent_clean.append(repr(item))
+
+        return jsonify({'port': port, 'baud': baud, 'recent_raw': recent_clean}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route("/api/evaluation-data", methods=["GET"])
 def evaluation_data():
     try:
@@ -650,8 +685,13 @@ if __name__ == "__main__":
     # When running with the Flask reloader (debug mode), the child process sets
     # WERKZEUG_RUN_MAIN='true'. We only start the thread in the reloader child
     # or when not debugging to avoid double-starting.
-    if (not app.debug) or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    # Allow controlling debug/reloader via env var `FLASK_DEBUG` (set to '1' to enable).
+    # Default is production-like single-process mode (no reloader).
+    flask_debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+
+    # Only start XBee listener in the reloader child or when not running with reloader.
+    if (not flask_debug) or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         t = threading.Thread(target=xbee_listener, daemon=True)
         t.start()
 
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=flask_debug, host="0.0.0.0", port=5000)

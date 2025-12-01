@@ -6,9 +6,15 @@ import time
 import os
 import logging
 from datetime import datetime
+from collections import deque
 
 # List of possible serial ports
+# Try common baud rates if initial connection doesn't yield data
 BAUD_RATE = 9600
+COMMON_BAUD_RATES = [9600, 19200, 38400, 57600, 115200]
+BAUD_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'instance', 'xbee_baud.json')
+# Keep a small recent raw buffer for diagnostics
+recent_raw = deque(maxlen=32)
 FLASK_API_URL = "http://127.0.0.1:5000/api/data"
 
 # module logger: quiet by default, enable verbose by setting XBEE_VERBOSE or XBEE_DEBUG
@@ -22,31 +28,55 @@ else:
 def find_xbee_port():
     """Finds the FT231X USB UART device, which is likely an XBee."""
     available_ports = list(serial.tools.list_ports.comports())
+    # Prefer known FTDI / XBee descriptors or USB tty devices
+    preferred_keywords = ["FT231X", "FTDI", "XBee", "Digi", "USB Serial", "USB-Serial"]
+    usb_devices = []
 
     for port in available_ports:
-        logger.debug("Checking port: %s (%s)", port.device, port.description)
+        logger.debug("Checking port: %s (%s) vid=%s pid=%s", port.device, port.description, getattr(port, 'vid', None), getattr(port, 'pid', None))
+        desc = (port.description or "").lower()
+        for kw in preferred_keywords:
+            if kw.lower() in desc:
+                logger.info("Possible XBee detected on %s (%s)", port.device, port.description)
+                return port.device
 
-        if "FT231X USB UART" in port.description:
-            logger.info("Possible XBee detected on %s", port.device)
-            return port.device
+        # collect generic USB-serial devices as fallback
+        if port.device and (port.device.startswith('/dev/ttyUSB') or port.device.startswith('/dev/ttyACM') or 'usb' in desc):
+            usb_devices.append(port.device)
 
-    logger.debug("No XBee module detected.")
+    if usb_devices:
+        logger.debug("Falling back to first USB serial device: %s", usb_devices[0])
+        return usb_devices[0]
+
+    logger.debug("No XBee/USB serial module detected.")
     return None
 
 
 def verify_xbee(port):
     """Verifies if the device on the given port is an XBee by sending an '+++' command."""
     try:
-        with serial.Serial(port, BAUD_RATE, timeout=2) as ser:
-            ser.write(b'+++')  # Enter command mode
-            time.sleep(1)  # Wait for response
-            response = ser.read(10).decode('utf-8').strip()
+        # Non-intrusive verification: do NOT send '+++' (it may change device mode).
+        # Instead, open the port and attempt a short read to confirm the device is responsive.
+        with serial.Serial(port, BAUD_RATE, timeout=1) as ser_conn:
+            try:
+                ser_conn.reset_input_buffer()
+            except Exception:
+                pass
+            # Wait briefly for any startup/banner data
+            time.sleep(0.2)
+            try:
+                resp = ser_conn.read(128)
+                response = resp.decode('utf-8', errors='replace').strip()
+            except Exception as re:
+                logger.debug("Error reading while verifying %s: %s", port, re)
+                response = ''
 
-            if "OK" in response:
-                logger.info("XBee module confirmed on %s!", port)
+            if response:
+                logger.debug("Non-intrusive verification read from %s: %r", port, response)
+                # Heuristic: presence of printable characters or braces suggests a serial sensor
                 return True
             else:
-                logger.debug("No response from %s. Might not be an XBee.", port)
+                logger.debug("No readable data on %s during verification.", port)
                 return False
     except Exception as e:
         logger.warning("Error verifying XBee on %s: %s", port, e)
@@ -64,18 +94,93 @@ def connect_xbee(retries=3, delay=2):
     Returns True if connected, False otherwise. Does not exit the process on failure.
     """
     global ser, _port
+    def load_saved_baud():
+        try:
+            if os.path.exists(BAUD_CONFIG_PATH):
+                with open(BAUD_CONFIG_PATH, 'r') as fh:
+                    j = json.load(fh)
+                    b = j.get('baud')
+                    try:
+                        return int(b)
+                    except Exception:
+                        return None
+        except Exception:
+            return None
+
+    def save_baud(b):
+        try:
+            os.makedirs(os.path.dirname(BAUD_CONFIG_PATH), exist_ok=True)
+            with open(BAUD_CONFIG_PATH, 'w') as fh:
+                json.dump({'baud': int(b)}, fh)
+        except Exception:
+            # non-fatal
+            pass
+        else:
+            logger.info("Saved XBee baud %s to %s", b, BAUD_CONFIG_PATH)
+
     for attempt in range(1, retries + 1):
         PORT = find_xbee_port()
-        if PORT and verify_xbee(PORT):
-            try:
-                ser = serial.Serial(PORT, BAUD_RATE, timeout=1)
-                _port = PORT
-                logger.info("Connected to XBee on %s at %d baud.", PORT, BAUD_RATE)
-                return True
-            except Exception as e:
-                logger.warning("Error connecting to XBee: %s", e)
+        if not PORT:
+            logger.debug("No serial port found for XBee on attempt %d", attempt)
         else:
-            logger.debug("XBee not found or verification failed.")
+            verified = verify_xbee(PORT)
+            # Try saved baud first (if any), then the preferred BAUD_RATE, then fall back
+            saved = load_saved_baud()
+            tried_bauds = []
+            if saved:
+                tried_bauds.append(saved)
+            if BAUD_RATE not in tried_bauds:
+                tried_bauds.append(BAUD_RATE)
+            for b in COMMON_BAUD_RATES:
+                if b not in tried_bauds:
+                    tried_bauds.append(b)
+            for baud in tried_bauds:
+                if verified:
+                    try:
+                        ser = serial.Serial(PORT, baud, timeout=1)
+                        _port = PORT
+                        logger.info("Connected to XBee on %s at %d baud (verified).", PORT, baud)
+                        try:
+                            # persist selected baud if it's not the saved value
+                            if baud != saved:
+                                save_baud(baud)
+                        except Exception:
+                            pass
+                        return True
+                    except Exception as e:
+                        logger.warning("Error connecting to verified XBee on %s at %d: %s", PORT, baud, e)
+                else:
+                    # Verification didn't detect streaming data; still try to open at different baud rates.
+                    try:
+                        # Try opening the port and do a short read probe to auto-detect the best baud
+                        probe_baud, sample = auto_baud_probe(PORT, tried_bauds)
+                        if probe_baud:
+                            ser = serial.Serial(PORT, probe_baud, timeout=1)
+                            _port = PORT
+                            logger.warning("Connected to serial port %s at %d (auto-detected); proceeding to listen.", PORT, probe_baud)
+                            # stash sample into recent_raw for diagnostics
+                            try:
+                                recent_raw.appendleft(sample.decode('utf-8', errors='replace'))
+                            except Exception:
+                                pass
+                            try:
+                                save_baud(probe_baud)
+                            except Exception:
+                                pass
+                            return True
+                        else:
+                            # Fall back to trying the baud explicitly
+                            ser = serial.Serial(PORT, baud, timeout=1)
+                            _port = PORT
+                            logger.warning("Connected to serial port %s at %d but verification failed; proceeding to listen.", PORT, baud)
+                            try:
+                                if baud != saved:
+                                    save_baud(baud)
+                            except Exception:
+                                pass
+                            return True
+                    except Exception as e:
+                        logger.debug("Error opening serial port %s at %d: %s", PORT, baud, e)
 
         if attempt < retries:
             time.sleep(delay)
@@ -99,6 +204,11 @@ def send_to_flask(data):
             logger.warning("Error sending data to Flask: %s %s", response.status_code, response.text)
     except Exception as e:
         logger.warning("Error communicating with Flask: %s", e)
+    finally:
+        try:
+            logger.info("Posted data to Flask endpoint; payload keys: %s", list(data.keys()) if isinstance(data, dict) else str(type(data)))
+        except Exception:
+            logger.info("Posted data to Flask endpoint; payload type: %s", type(data))
 
 
 def parse_xbee_data(raw_data):
@@ -193,6 +303,42 @@ def _extract_json_from_buffer(buf):
     return None, buf
 
 
+def auto_baud_probe(port, bauds=None, timeout_per_baud=0.4):
+    """Try a list of baud rates and return (baud, sample_bytes) for the first
+    baud that returns readable data. Returns (None, b'') if none found.
+    This is non-destructive: it opens the port briefly and closes it.
+    """
+    if bauds is None:
+        bauds = COMMON_BAUD_RATES
+    for baud in bauds:
+        try:
+            s = serial.Serial(port, baud, timeout=timeout_per_baud)
+            try:
+                # flush input, wait a short time, then read
+                try:
+                    s.reset_input_buffer()
+                except Exception:
+                    pass
+                time.sleep(0.05)
+                data = s.read(256)
+                if data and len(data) > 0:
+                    logger.debug("auto_baud_probe: port %s baud %d returned %d bytes", port, baud, len(data))
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                    return baud, data
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug("auto_baud_probe: cannot open %s at %d: %s", port, baud, e)
+            continue
+    return None, b''
+
+
 def main():
     # modify module-level `ser` and `_buffer`
     global ser, _buffer
@@ -206,14 +352,67 @@ def main():
                 continue
 
             if ser.in_waiting > 0:
-                # read all available bytes and append to buffer
+                # Read available bytes with small retries — sometimes the port
+                # reports available data but read() returns empty due to transient
+                # device state or concurrent access. If empty reads persist,
+                # close and reconnect the serial port to recover.
                 try:
-                    chunk = ser.read(ser.in_waiting)
-                    chunk = chunk.decode('utf-8', errors='replace')
+                    to_read = ser.in_waiting
+                    chunk_bytes = b''
+                    attempts = 0
+                    # Try a few quick retries to allow device to flush data
+                    while attempts < 3 and len(chunk_bytes) == 0:
+                        # read at most `to_read` bytes, fallback to 1 if 0
+                        read_len = to_read if to_read and to_read > 0 else 1
+                        chunk_bytes = ser.read(read_len)
+                        attempts += 1
+                        if len(chunk_bytes) == 0:
+                            time.sleep(0.05)
+
+                    if len(chunk_bytes) == 0:
+                        # Persistent empty read despite reported data — likely
+                        # device disconnect or concurrent access. Reopen port.
+                        logger.debug("Serial reported %s bytes but read returned empty; reopening port", to_read)
+                        try:
+                            port_name = getattr(ser, 'port', None)
+                            ser.close()
+                        except Exception:
+                            pass
+                        ser = None
+                        # short backoff before reconnecting
+                        time.sleep(1.0)
+                        continue
+
+                    # decode and append
+                    chunk = chunk_bytes.decode('utf-8', errors='replace')
+                except serial.SerialException as e:
+                    logger.warning("SerialException reading serial chunk: %s", e)
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+                    ser = None
+                    time.sleep(1.0)
+                    continue
+                except OSError as e:
+                    logger.warning("OSError reading serial chunk: %s", e)
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+                    ser = None
+                    time.sleep(1.0)
+                    continue
                 except Exception as e:
                     logger.warning("Error reading serial chunk: %s", e)
                     chunk = ''
+
                 _buffer += chunk
+                # record raw chunk for diagnostics
+                try:
+                    recent_raw.appendleft(chunk)
+                except Exception:
+                    pass
 
                 # Try extracting any complete JSON objects from the buffer
                 while True:
