@@ -6,6 +6,7 @@ from uuid import uuid4
 import traceback
 
 from flask import Flask, request, jsonify, render_template
+import json
 from flask_sqlalchemy import SQLAlchemy
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -42,6 +43,7 @@ class SensorData(db.Model):
     pm10 = db.Column(db.Float, nullable=True)
     timestamp = db.Column(db.DateTime, default=db.func.current_timestamp())
     uuid = db.Column(db.String(36), nullable=True)
+    raw_payload = db.Column(db.Text, nullable=True)
 
 # Database model for MQ sensor data
 class MQSensorData(db.Model):
@@ -65,6 +67,7 @@ class MQSensorData(db.Model):
     uuid = db.Column(db.String(36), nullable=True)
     sd_aqi = db.Column(db.Float, nullable=True)
     sd_aqi_level = db.Column(db.String(64), nullable=True)
+    raw_payload = db.Column(db.Text, nullable=True)
 
 
 # Run DB migration script (best-effort) before creating tables so the
@@ -93,7 +96,11 @@ try:
                 def has_col(tbl, col):
                     cur.execute(f"PRAGMA table_info('{tbl}')")
                     return any(r[1] == col for r in cur.fetchall())
-                ok = has_col('sensor_data', 'uuid') and has_col('mq_sensor_data', 'uuid') and has_col('mq_sensor_data', 'sd_aqi') and has_col('mq_sensor_data', 'sd_aqi_level')
+                ok = (
+                    has_col('sensor_data', 'uuid') and has_col('sensor_data', 'raw_payload')
+                    and has_col('mq_sensor_data', 'uuid') and has_col('mq_sensor_data', 'sd_aqi')
+                    and has_col('mq_sensor_data', 'sd_aqi_level') and has_col('mq_sensor_data', 'raw_payload')
+                )
                 try:
                     cur.close()
                     conn.close()
@@ -167,6 +174,12 @@ with app.app_context():
                     conn.commit()
                 except Exception:
                     conn.rollback()
+            if 'raw_payload' not in cols:
+                try:
+                    cur.execute("ALTER TABLE sensor_data ADD COLUMN raw_payload TEXT")
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
 
         if 'mq_sensor_data' in tables:
             cols = table_columns('mq_sensor_data')
@@ -187,6 +200,12 @@ with app.app_context():
             if 'sd_aqi_level' not in cols:
                 try:
                     cur.execute("ALTER TABLE mq_sensor_data ADD COLUMN sd_aqi_level TEXT")
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+            if 'raw_payload' not in cols:
+                try:
+                    cur.execute("ALTER TABLE mq_sensor_data ADD COLUMN raw_payload TEXT")
                     conn.commit()
                 except Exception:
                     conn.rollback()
@@ -355,6 +374,11 @@ def receive_data():
             sensor_kwargs['timestamp'] = parsed_ts if parsed_ts is not None else None
         if 'uuid' in SENSOR_COLUMNS:
             sensor_kwargs['uuid'] = str(uuid4())
+        if 'raw_payload' in SENSOR_COLUMNS:
+            try:
+                sensor_kwargs['raw_payload'] = json.dumps(data, ensure_ascii=False)
+            except Exception:
+                sensor_kwargs['raw_payload'] = str(data)
         new_sensor_data = SensorData(**sensor_kwargs)
         db.session.add(new_sensor_data)
 
@@ -384,6 +408,11 @@ def receive_data():
             mq_kwargs['sd_aqi'] = pick_keys('sd_aqi', 'SD_AQI', 'sdAqi')
         if 'sd_aqi_level' in MQ_COLUMNS:
             mq_kwargs['sd_aqi_level'] = pick_keys('sd_aqi_level', 'SD_AQI_level', 'sdAqiLevel')
+        if 'raw_payload' in MQ_COLUMNS:
+            try:
+                mq_kwargs['raw_payload'] = json.dumps(data, ensure_ascii=False)
+            except Exception:
+                mq_kwargs['raw_payload'] = str(data)
 
         new_mq_data = MQSensorData(**mq_kwargs)
         db.session.add(new_mq_data)
