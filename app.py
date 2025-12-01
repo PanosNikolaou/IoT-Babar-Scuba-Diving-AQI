@@ -1,17 +1,24 @@
 import json
 import time
+import threading
+import os
+from datetime import datetime
+from uuid import uuid4
 
 from flask import Flask, request, jsonify, render_template
 from flask_sqlalchemy import SQLAlchemy
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from sqlalchemy.exc import OperationalError
 
-from xbreemw import ser
+import xbreemw
 
 app = Flask(__name__)
 
 # Database configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///iot_data.db'
+# Use the `instance` folder DB to avoid updating the wrong file during migrations/tests
+DB_FILE = os.path.join(os.path.dirname(__file__), 'instance', 'iot_data.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{DB_FILE}"
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
@@ -27,6 +34,7 @@ class SensorData(db.Model):
     pm2_5 = db.Column(db.Float, nullable=True)
     pm10 = db.Column(db.Float, nullable=True)
     timestamp = db.Column(db.DateTime, default=db.func.current_timestamp())
+    uuid = db.Column(db.String(36), nullable=True)
 
 # Database model for MQ sensor data
 class MQSensorData(db.Model):
@@ -47,11 +55,150 @@ class MQSensorData(db.Model):
     temperature = db.Column(db.Float, nullable=True)
     humidity = db.Column(db.Float, nullable=True)
     timestamp = db.Column(db.DateTime, default=db.func.current_timestamp())
+    uuid = db.Column(db.String(36), nullable=True)
+    sd_aqi = db.Column(db.Float, nullable=True)
+    sd_aqi_level = db.Column(db.String(64), nullable=True)
 
+
+# Run DB migration script (best-effort) before creating tables so the
+# on-disk SQLite schema matches the SQLAlchemy models. Only run the
+# migration in the reloader child (WERKZEUG_RUN_MAIN='true') or when
+# not running in debug mode to avoid doing it twice and creating
+# repeated backups during watchdog restarts.
+try:
+    do_migrate = (not app.debug) or os.environ.get("WERKZEUG_RUN_MAIN") == "true"
+    if do_migrate:
+        import subprocess, sys
+        migrate_script = os.path.join(os.path.dirname(__file__), 'scripts', 'migrate_db.py')
+        marker = os.path.join(os.path.dirname(__file__), '.migration_done')
+        # If we've already run migration in this workspace, do a quick verification
+        # that the expected columns exist. If they don't, run migration again.
+        def _needs_migration(marker_path, db_path):
+            # If no marker, definitely need migration
+            if not os.path.exists(marker_path):
+                return True
+            # marker exists — verify DB actually has the expected columns
+            try:
+                import sqlite3
+                conn = sqlite3.connect(db_path)
+                cur = conn.cursor()
+                def has_col(tbl, col):
+                    cur.execute(f"PRAGMA table_info('{tbl}')")
+                    return any(r[1] == col for r in cur.fetchall())
+                ok = has_col('sensor_data', 'uuid') and has_col('mq_sensor_data', 'uuid') and has_col('mq_sensor_data', 'sd_aqi') and has_col('mq_sensor_data', 'sd_aqi_level')
+                try:
+                    cur.close()
+                    conn.close()
+                except Exception:
+                    pass
+                return not ok
+            except Exception:
+                # If we can't verify, be conservative and run migration
+                return True
+
+        db_path = DB_FILE
+        if _needs_migration(marker, db_path):
+            if os.path.exists(migrate_script):
+                subprocess.check_call([sys.executable, migrate_script, '--db', db_path, '--yes'])
+                try:
+                    # create or update the marker file to avoid repeating the migration
+                    with open(marker, 'w') as f:
+                        f.write('migrated\n')
+                except Exception:
+                    pass
+        else:
+            print('Migration marker present; skipping migration')
+    else:
+        # In the reloader parent process, skip migration to avoid duplicate backups/logs
+        print('Skipping DB migration in reloader parent process')
+except Exception as e:
+    # Non-fatal: log and continue; create_all() will still try to create missing tables
+    print('Migration script failed or not run:', e)
 
 # Create the database tables
 with app.app_context():
     db.create_all()
+
+    # Ensure the uuid, sd_aqi and sd_aqi_level columns exist in existing SQLite tables; if not, add them.
+    # Use a raw sqlite connection for robustness and commit immediately.
+    try:
+        engine = db.get_engine(app)
+        # table_names() is deprecated in newer SQLAlchemy; use inspector when available
+        from sqlalchemy import inspect
+        inspector = inspect(engine)
+        tables = inspector.get_table_names()
+
+        # open a raw connection for PRAGMA/ALTER statements
+        conn = engine.raw_connection()
+        cur = conn.cursor()
+
+        def table_columns(table_name):
+            cur.execute(f"PRAGMA table_info('{table_name}')")
+            return [row[1] for row in cur.fetchall()]
+
+        if 'sensor_data' in tables:
+            cols = table_columns('sensor_data')
+            if 'uuid' not in cols:
+                try:
+                    cur.execute("ALTER TABLE sensor_data ADD COLUMN uuid TEXT")
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+
+        if 'mq_sensor_data' in tables:
+            cols = table_columns('mq_sensor_data')
+            if 'uuid' not in cols:
+                try:
+                    cur.execute("ALTER TABLE mq_sensor_data ADD COLUMN uuid TEXT")
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                # refresh cols
+                cols = table_columns('mq_sensor_data')
+            if 'sd_aqi' not in cols:
+                try:
+                    cur.execute("ALTER TABLE mq_sensor_data ADD COLUMN sd_aqi REAL")
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+            if 'sd_aqi_level' not in cols:
+                try:
+                    cur.execute("ALTER TABLE mq_sensor_data ADD COLUMN sd_aqi_level TEXT")
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+    except Exception as e:
+        # Non-fatal: if this fails (e.g., non-sqlite engine), log and continue; new DBs will include the columns.
+        print('Warning ensuring schema columns:', e)
+    # Determine which columns actually exist in the tables so we can avoid referencing missing columns
+    SENSOR_COLUMNS = set()
+    MQ_COLUMNS = set()
+    try:
+        engine = db.get_engine(app)
+        conn = engine.raw_connection()
+        cur = conn.cursor()
+        def cols(table):
+            try:
+                cur.execute(f"PRAGMA table_info('{table}')")
+                return set([r[1] for r in cur.fetchall()])
+            except Exception:
+                return set()
+        SENSOR_COLUMNS = cols('sensor_data')
+        MQ_COLUMNS = cols('mq_sensor_data')
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+    except Exception:
+        SENSOR_COLUMNS = set()
+        MQ_COLUMNS = set()
 
 @app.route("/api/data", methods=["POST"])
 @limiter.limit("10 per second")  # Limit to 10 requests per second
@@ -62,32 +209,65 @@ def receive_data():
         if not data:
             return jsonify({"status": "error", "message": "No JSON data received"}), 400
 
-        # Store general sensor data
-        new_sensor_data = SensorData(
-            dust=data.get("dust_density", 0.0),
-            pm2_5=data.get("pm2_5", 0.0),
-            pm10=data.get("pm10", 0.0)
-        )
+        # If the payload includes a 'timestamp' field (ISO string), try to parse it
+        parsed_ts = None
+        if isinstance(data, dict):
+            ts_val = data.get('timestamp') or data.get('timestamp_ms')
+            if ts_val:
+                try:
+                    # If timestamp is millis (timestamp_ms) it will be numeric; otherwise expect ISO
+                    if isinstance(ts_val, (int, float)):
+                        # fallback: use server time when only millis provided
+                        parsed_ts = datetime.utcnow()
+                    else:
+                        # try parsing ISO formatted timestamp
+                        parsed_ts = datetime.fromisoformat(str(ts_val))
+                except Exception:
+                    parsed_ts = None
+
+        # Store general sensor data (only include columns that exist)
+        sensor_kwargs = {}
+        if 'dust' in SENSOR_COLUMNS or True:
+            sensor_kwargs['dust'] = data.get('dust_density', 0.0)
+        if 'pm2_5' in SENSOR_COLUMNS or True:
+            sensor_kwargs['pm2_5'] = data.get('pm2_5', 0.0)
+        if 'pm10' in SENSOR_COLUMNS or True:
+            sensor_kwargs['pm10'] = data.get('pm10', 0.0)
+        if 'timestamp' in SENSOR_COLUMNS:
+            sensor_kwargs['timestamp'] = parsed_ts if parsed_ts is not None else None
+        if 'uuid' in SENSOR_COLUMNS:
+            sensor_kwargs['uuid'] = str(uuid4())
+        new_sensor_data = SensorData(**sensor_kwargs)
         db.session.add(new_sensor_data)
 
-        # Store MQ sensor data
-        new_mq_data = MQSensorData(
-            lpg=data.get("LPG"),
-            co=data.get("CO"),
-            smoke=data.get("Smoke"),
-            co_mq7=data.get("CO_MQ7"),
-            ch4=data.get("CH4"),
-            co_mq9=data.get("CO_MQ9"),
-            co2=data.get("CO2"),
-            nh3=data.get("NH3"),
-            nox=data.get("NOx"),
-            alcohol=data.get("Alcohol"),
-            benzene=data.get("Benzene"),
-            h2=data.get("H2"),
-            air=data.get("Air"),
-            temperature = data.get("Temperature"),
-            humidity = data.get("Humidity")
-        )
+        # Store MQ sensor data (only include columns that exist in DB)
+        mq_kwargs = {}
+        def pick_keys(*keys):
+            for k in keys:
+                if k in data and data[k] is not None:
+                    return data[k]
+            return None
+
+        field_map = {
+            'lpg':'LPG','co':'CO','smoke':'Smoke','co_mq7':'CO_MQ7','ch4':'CH4','co_mq9':'CO_MQ9',
+            'co2':'CO2','nh3':'NH3','nox':'NOx','alcohol':'Alcohol','benzene':'Benzene','h2':'H2','air':'Air',
+            'temperature':'Temperature','humidity':'Humidity'
+        }
+        for col, key in field_map.items():
+            if col in MQ_COLUMNS:
+                mq_kwargs[col] = pick_keys(key, key.lower())
+
+        if 'timestamp' in MQ_COLUMNS:
+            mq_kwargs['timestamp'] = parsed_ts if parsed_ts is not None else None
+        if 'uuid' in MQ_COLUMNS:
+            mq_kwargs['uuid'] = str(uuid4())
+        # sd_aqi fields
+        if 'sd_aqi' in MQ_COLUMNS:
+            mq_kwargs['sd_aqi'] = pick_keys('sd_aqi', 'SD_AQI', 'sdAqi')
+        if 'sd_aqi_level' in MQ_COLUMNS:
+            mq_kwargs['sd_aqi_level'] = pick_keys('sd_aqi_level', 'SD_AQI_level', 'sdAqiLevel')
+
+        new_mq_data = MQSensorData(**mq_kwargs)
         db.session.add(new_mq_data)
 
         db.session.commit()
@@ -99,7 +279,7 @@ def receive_data():
 
 @app.route("/api/data", methods=["GET"])
 def get_data():
-    try:
+    def _run_query_once():
         # Pagination parameters
         page = request.args.get("page", 1, type=int)  # Default to page 1
         per_page = request.args.get("per_page", 50, type=int)  # Default to 50 records per page
@@ -114,14 +294,18 @@ def get_data():
 
         # Format data for JSON response, skipping records where all values are 0
         general_data = [{
-            "timestamp": r.timestamp.isoformat(),
+            "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+            "uuid": getattr(r, 'uuid', None) if getattr(r, 'uuid', None) is not None else None,
             "dust": r.dust if r.dust is not None else 0,
             "pm2_5": r.pm2_5 if r.pm2_5 is not None else 0,
             "pm10": r.pm10 if r.pm10 is not None else 0
         } for r in general_records if not (r.dust == 0 and r.pm2_5 == 0 and r.pm10 == 0)]
 
         mq_data = [{
-            "timestamp": r.timestamp.isoformat(),
+            "uuid": getattr(r, 'uuid', None) if getattr(r, 'uuid', None) is not None else None,
+            "sd_aqi": getattr(r, 'sd_aqi', None),
+            "sd_aqi_level": getattr(r, 'sd_aqi_level', None),
+            "timestamp": r.timestamp.isoformat() if r.timestamp else None,
             "LPG": r.lpg if r.lpg is not None else 0,
             "CO": r.co if r.co is not None else 0,
             "Smoke": r.smoke if r.smoke is not None else 0,
@@ -148,6 +332,30 @@ def get_data():
             "per_page": pagination.per_page,         # Records per page
             "pages": pagination.pages                # Total pages
         })
+
+    try:
+        return _run_query_once()
+    except OperationalError as oe:
+        # If schema is out of sync at runtime, try running the migration script once and retry
+        try:
+            import subprocess, sys
+            migrate_script = os.path.join(os.path.dirname(__file__), 'scripts', 'migrate_db.py')
+            if os.path.exists(migrate_script):
+                subprocess.check_call([sys.executable, migrate_script, '--db', db_path, '--yes'])
+                # dispose engine and remove session to ensure new schema is seen
+                try:
+                    db.session.remove()
+                except Exception:
+                    pass
+                try:
+                    db.engine.dispose()
+                except Exception:
+                    pass
+                return _run_query_once()
+        except Exception:
+            pass
+        print("Error:", str(oe))
+        return jsonify({"status": "error", "message": str(oe)}), 500
     except Exception as e:
         print("Error:", str(e))
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -157,16 +365,15 @@ def get_data():
 @app.route("/")
 def index():
     return render_template("index.html")
-
+ 
 @app.route("/mq-data")
 def mq_data():
-
     return render_template("mq_data.html")
+
 
 @app.route("/api/mq-data", methods=["GET"])
 def get_mq_data():
     try:
-        # Filter out records where fields are None
         mq_records = MQSensorData.query.filter(
             MQSensorData.lpg.isnot(None),
             MQSensorData.co.isnot(None),
@@ -185,9 +392,11 @@ def get_mq_data():
             MQSensorData.humidity.isnot(None)
         ).order_by(MQSensorData.timestamp.desc()).all()
 
-        # Format data for the response
         mq_data = [{
-            "timestamp": r.timestamp.isoformat(),
+            "uuid": r.uuid if r.uuid is not None else None,
+            "sd_aqi": getattr(r, 'sd_aqi', None),
+            "sd_aqi_level": getattr(r, 'sd_aqi_level', None),
+            "timestamp": r.timestamp.isoformat() if r.timestamp else None,
             "temperature": r.temperature,
             "humidity": r.humidity,
             "LPG": r.lpg,
@@ -206,6 +415,65 @@ def get_mq_data():
         } for r in mq_records]
 
         return jsonify({"mq_data": mq_data}), 200
+    except OperationalError as oe:
+        # Try running migration + disposing engine/session and retry once
+        try:
+            import subprocess, sys
+            migrate_script = os.path.join(os.path.dirname(__file__), 'scripts', 'migrate_db.py')
+            if os.path.exists(migrate_script):
+                subprocess.check_call([sys.executable, migrate_script, '--db', DB_FILE, '--yes'])
+                try:
+                    db.session.remove()
+                except Exception:
+                    pass
+                try:
+                    db.engine.dispose()
+                except Exception:
+                    pass
+                # retry
+                mq_records = MQSensorData.query.filter(
+                    MQSensorData.lpg.isnot(None),
+                    MQSensorData.co.isnot(None),
+                    MQSensorData.smoke.isnot(None),
+                    MQSensorData.co_mq7.isnot(None),
+                    MQSensorData.ch4.isnot(None),
+                    MQSensorData.co_mq9.isnot(None),
+                    MQSensorData.co2.isnot(None),
+                    MQSensorData.nh3.isnot(None),
+                    MQSensorData.nox.isnot(None),
+                    MQSensorData.alcohol.isnot(None),
+                    MQSensorData.benzene.isnot(None),
+                    MQSensorData.h2.isnot(None),
+                    MQSensorData.air.isnot(None),
+                    MQSensorData.temperature.isnot(None),
+                    MQSensorData.humidity.isnot(None)
+                ).order_by(MQSensorData.timestamp.desc()).all()
+                mq_data = [{
+                    "uuid": r.uuid if r.uuid is not None else None,
+                    "sd_aqi": getattr(r, 'sd_aqi', None),
+                    "sd_aqi_level": getattr(r, 'sd_aqi_level', None),
+                    "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+                    "temperature": r.temperature,
+                    "humidity": r.humidity,
+                    "LPG": r.lpg,
+                    "CO": r.co,
+                    "Smoke": r.smoke,
+                    "CO_MQ7": r.co_mq7,
+                    "CH4": r.ch4,
+                    "CO_MQ9": r.co_mq9,
+                    "CO2": r.co2,
+                    "NH3": r.nh3,
+                    "NOx": r.nox,
+                    "Alcohol": r.alcohol,
+                    "Benzene": r.benzene,
+                    "H2": r.h2,
+                    "Air": r.air
+                } for r in mq_records]
+                return jsonify({"mq_data": mq_data}), 200
+        except Exception:
+            pass
+        print("Error:", str(oe))
+        return jsonify({"status": "error", "message": str(oe)}), 500
     except Exception as e:
         print("Error:", str(e))
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -213,6 +481,35 @@ def get_mq_data():
 @app.route("/evaluation")
 def evaluation():
     return render_template("evaluation.html")
+
+
+@app.route("/_debug/db-info")
+def _debug_db_info():
+    try:
+        import sqlite3
+        db_path = DB_FILE
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        def cols(table):
+            try:
+                cur.execute(f"PRAGMA table_info('{table}')")
+                return [r[1] for r in cur.fetchall()]
+            except Exception:
+                return []
+        sensor_cols = cols('sensor_data')
+        mq_cols = cols('mq_sensor_data')
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+        return jsonify({
+            'db_path': os.path.abspath(db_path),
+            'sensor_cols': sensor_cols,
+            'mq_cols': mq_cols
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route("/api/evaluation-data", methods=["GET"])
 def evaluation_data():
@@ -238,45 +535,47 @@ def evaluation_data():
 
 # XBee Listener Function
 def xbee_listener():
-    """Continuously listen for data from XBee and send it to the Flask API."""
+    """Run the XBee reading loop provided by `xbreemw` with backoff.
+
+    Behavior changes to avoid noisy logs when no USB/XBee is plugged in:
+    - Check for a serial port first with `find_xbee_port()` and wait longer
+      if no port is present.
+    - Attempt a small number of connects before sleeping.
+    - If `xbreemw.main()` exits, back off briefly before restarting.
+    """
     while True:
         try:
-            if ser.in_waiting > 0:
-                raw_data = ser.readline().decode('utf-8').strip()  # Read and decode the data
-                parsed_data = parse_xbee_data(raw_data)
-                if parsed_data:
-                    send_to_flask(parsed_data)
+            # If there's no physical port, don't spam checks — sleep longer.
+            port = xbreemw.find_xbee_port()
+            if not port:
+                time.sleep(5)
+                continue
+
+            # Try to connect (a small number of quick retries).
+            if xbreemw.ser is None:
+                connected = xbreemw.connect_xbee(retries=2, delay=1)
+                if not connected:
+                    # Give a longer pause before the next probe to avoid spamming
+                    time.sleep(5)
+                    continue
+
+            # Run the reader loop. If it returns (disconnect or error), retry with backoff.
+            xbreemw.main()
+            # If main() ever returns without exception, sleep a bit before retrying
+            time.sleep(2)
         except Exception as e:
-            print(f"Error reading from XBee: {e}")
-        time.sleep(0.1)
-
-def parse_xbee_data(raw_data):
-    """Parse data received from XBee."""
-    try:
-        # Assuming the XBee sends data in JSON format
-        data = json.loads(raw_data)
-        print("Received data from XBee:", data)
-        return data
-    except json.JSONDecodeError:
-        print("Invalid data format. Skipping:", raw_data)
-        return None
-
-def send_to_flask(data):
-    """Simulate an internal POST request by directly inserting into the database."""
-    try:
-        new_data = SensorData(
-            dust=data.get("dust_density", 0.0),
-            pm2_5=data.get("pm2_5", 0.0),
-            pm10=data.get("pm10", 0.0)
-        )
-        with app.app_context():
-            db.session.add(new_data)
-            db.session.commit()
-        print("Data successfully saved to the database:", data)
-    except Exception as e:
-        print(f"Error saving XBee data to database: {e}")
+            print(f"XBee listener encountered error: {e}")
+            time.sleep(2)
 
 
 
 if __name__ == "__main__":
+    # Start the XBee listener in a background daemon thread.
+    # When running with the Flask reloader (debug mode), the child process sets
+    # WERKZEUG_RUN_MAIN='true'. We only start the thread in the reloader child
+    # or when not debugging to avoid double-starting.
+    if (not app.debug) or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        t = threading.Thread(target=xbee_listener, daemon=True)
+        t.start()
+
     app.run(debug=True, host="0.0.0.0", port=5000)

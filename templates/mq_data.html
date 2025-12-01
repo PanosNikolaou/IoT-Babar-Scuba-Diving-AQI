@@ -12,6 +12,10 @@
     <!-- Chart.js Library -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+    <!-- jQuery and DataTables -->
+    <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
 </head>
 <body class="bg-light">
 <!-- Top Bar -->
@@ -51,6 +55,48 @@
 <div id="content">
     <div class="container mt-5" >
         <h1 class="text-center mb-4" >Metal Oxide Semiconductor (MOS) Sensors</h1>
+
+        <!-- Summary Card -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-body">
+                        <h3 class="card-title">Air Quality Summary</h3>
+                        <div class="row">
+                            <div class="col-md-8">
+                                <table class="table table-sm table-borderless mb-0">
+                                    <tbody>
+                                    <tr><th>LPG (MQ2)</th><td id="lpg-val">—</td></tr>
+                                    <tr><th>CO (MQ2)</th><td id="co-val">—</td></tr>
+                                    <tr><th>Smoke (MQ2)</th><td id="smoke-val">—</td></tr>
+                                    <tr><th>CO (MQ7)</th><td id="co-mq7-val">—</td></tr>
+                                    <tr><th>CH4 (MQ4)</th><td id="ch4-val">—</td></tr>
+                                    <tr><th>CO (MQ9)</th><td id="co-mq9-val">—</td></tr>
+                                    <tr><th>CO2 (MQ135)</th><td id="co2-val">—</td></tr>
+                                    <tr><th>NH3 (MQ135)</th><td id="nh3-val">—</td></tr>
+                                    <tr><th>NOx (MQ135)</th><td id="nox-val">—</td></tr>
+                                    <tr><th>Alcohol (MQ135)</th><td id="alcohol-val">—</td></tr>
+                                    <tr><th>Benzene (MQ135)</th><td id="benzene-val">—</td></tr>
+                                    <tr><th>H2 (MQ8)</th><td id="h2-val">—</td></tr>
+                                    <tr><th>Air (MQ8)</th><td id="air-val">—</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div class="col-md-4 d-flex flex-column align-items-center justify-content-center">
+                                <div class="mb-3 text-center">
+                                    <div id="sd-aqi-badge" class="badge rounded-pill" style="font-size:1.25rem;padding:0.75rem 1rem;">—</div>
+                                </div>
+                                <div class="text-center">
+                                    <p class="mb-1"><strong>Temperature:</strong> <span id="temp-val">—</span> °C</p>
+                                    <p class="mb-0"><strong>Humidity:</strong> <span id="hum-val">—</span> %</p>
+                                    <p class="mb-0 mt-2"><small class="text-muted">Recorded at: <span id="recorded-at">—</span></small></p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
 
         <!-- MQ Sensors Chart -->
         <div id="chart" class="row mb-5">
@@ -118,18 +164,61 @@
             </div>
         </div>
 
+        <!-- Analysis & Controls -->
+        <div class="row mb-4">
+            <div class="col-md-8">
+                <div class="card">
+                    <div class="card-body">
+                        <h5 class="card-title">Live Analysis</h5>
+                        <div id="analysis-container" class="row g-3">
+                            <!-- Cards populated by JS -->
+                        </div>
+                        <div id="fallback-hint" class="mt-2" style="display:none;"></div>
+                        <div class="mt-3 small text-muted">Last updated: <span id="last-updated">—</span></div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card">
+                    <div class="card-body">
+                        <h5 class="card-title">Live Controls</h5>
+                        <div class="mb-2">
+                            <label class="form-label">Polling</label>
+                            <div class="d-flex align-items-center">
+                                <button id="poll-toggle" class="btn btn-sm btn-success me-2">Pause</button>
+                                <label class="me-2">Interval (ms)</label>
+                                <input id="poll-interval" type="number" class="form-control form-control-sm" value="1000" min="200" style="width:110px">
+                            </div>
+                        </div>
+                        <div>
+                            <label class="form-label">Chart Options</label>
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" value="" id="show-temperature" checked>
+                                <label class="form-check-label" for="show-temperature">Show Temperature</label>
+                            </div>
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" value="" id="show-humidity" checked>
+                                <label class="form-check-label" for="show-humidity">Show Humidity</label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
 
         <!-- MQ Sensors Table -->
         <div id="table" class="row">
             <div class="col-12">
                 <h2 class="text-center">MQ Sensors Table</h2>
                 <div class="table-container" style="max-height: 300px; overflow-y: auto;">
-                    <table class="table table-bordered table-striped">
+                    <table id="mq-data-table" class="table table-bordered table-striped display" style="width:100%">
                         <thead class="table-dark">
                         <tr>
                             <th>Timestamp</th>
                             <th>Temperature</th>
                             <th>Humidity</th>
+                            <th>SD_AQI</th>
                             <th>LPG</th>
                             <th>CO</th>
                             <th>Smoke</th>
@@ -184,6 +273,8 @@
                 <p><strong>Benzene:</strong> <span id="modal-benzene"></span></p>
                 <p><strong>H2:</strong> <span id="modal-h2"></span></p>
                 <p><strong>Air:</strong> <span id="modal-air"></span></p>
+                <p><strong>SD_AQI:</strong> <span id="modal-sd-aqi"></span></p>
+                <p><strong>SD_AQI Level:</strong> <span id="modal-sd-aqi-level"></span></p>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>

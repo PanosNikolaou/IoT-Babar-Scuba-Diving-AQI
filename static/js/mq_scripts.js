@@ -55,6 +55,11 @@ const mqChart = new Chart(mqCtx, {
 let mqCurrentPage = 1;
 const mqRecordsPerPage = 10;
 let activeFilter = '24hours'; // Default filter
+let mqDataTable = null;
+let lastFilteredData = [];
+let pollIntervalMs = 1000;
+let pollTimerId = null;
+let isPolling = true;
 
 document.getElementById('timeFilter').addEventListener('change', (event) => {
     activeFilter = event.target.value;
@@ -72,20 +77,217 @@ async function fetchMqData() {
         const response = await fetch('/api/mq-data');
         const result = await response.json();
 
-        const mqData = result.mq_data || [];
+        // Store result in the global mqData so other controls can use it
+        mqData = result.mq_data || [];
+
+        // Note: render summary after filtering so the "previous" value for deltas is available
+        // (use fallback logic below if filter yields no results)
+        
+        // Render summary will be called after we determine the sortedFiltered dataset below.
+        if (!mqData || mqData.length === 0) {
+                    // Clear structured fields when no data
+                    const ids = ['lpg','co','smoke','co-mq7','ch4','co-mq9','co2','nh3','nox','alcohol','benzene','h2','air','temp','hum'];
+                    ids.forEach(id => {
+                        const el = document.getElementById(id + '-val');
+                        if (el) el.innerText = '—';
+                    });
+                    const badge = document.getElementById('sd-aqi-badge');
+                    if (badge) { badge.innerText = '—'; badge.style.backgroundColor = ''; badge.style.color = ''; }
+                }
 
         // Filter data based on selected criteria
-        const filteredMqData = filterDataByCriteria(mqData);
+        const filteredMqData = filterDataByCriteria(mqData || []);
+        // If the filter produced no results (e.g. latest data is older than the time window),
+        // fall back to using the most recent available records so the UI isn't empty.
+        let usedData = filteredMqData;
+        if ((!usedData || usedData.length === 0) && mqData && mqData.length > 0) {
+            usedData = mqData.slice();
+        }
 
-        // Update the chart
-        updateMqChart(filteredMqData);
+        // Indicate if we're using fallback (filtered result empty -> using latest available)
+        const usingFallback = ((!filteredMqData || filteredMqData.length === 0) && mqData && mqData.length > 0);
 
-        // Render the table and pagination
-        renderMqTablePage(filteredMqData, mqCurrentPage);
-        renderMqPaginationControls(filteredMqData);
+        // Update fallback hint UI
+        const fallbackEl = document.getElementById('fallback-hint');
+        if (fallbackEl) {
+            if (usingFallback) {
+                const latestTs = new Date(mqData[0].timestamp).toLocaleString();
+                fallbackEl.style.display = 'block';
+                fallbackEl.innerHTML = `<div class="alert alert-warning p-1 m-0">Showing latest available data (latest record: ${latestTs}), which is older than the selected filter.</div>`;
+            } else {
+                fallbackEl.style.display = 'none';
+                fallbackEl.innerHTML = '';
+            }
+        }
+
+        // Sort usedData newest-first for chart/table/analysis and save for row click lookup
+        const sortedFiltered = usedData.slice().sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+        lastFilteredData = sortedFiltered.slice();
+
+        // Render summary now that we have the sorted dataset (pass previous record for deltas)
+        if (sortedFiltered.length > 0) {
+            const latest = sortedFiltered[0];
+            const prev = sortedFiltered.length > 1 ? sortedFiltered[1] : null;
+            renderMqSummary(latest, prev);
+        }
+
+        // Update the chart (chart update function will handle internal ordering/limiting)
+        updateMqChart(sortedFiltered);
+
+        // Update DataTable with latest filtered (or fallback) data
+        updateMqDataTable(sortedFiltered);
+
+        // Compute and render analysis cards
+        computeAndRenderAnalysis(sortedFiltered);
+
+        // Update last-updated timestamp
+        if (typeof window.__updateLastUpdated === 'function') {
+            window.__updateLastUpdated(new Date().toLocaleString());
+        }
     } catch (error) {
         console.error('Error fetching MQ data:', error);
     }
+}
+
+// Render a human-readable summary and compute a simple SD-AQI
+// Compute and render structured summary including SD-AQI badge
+function renderMqSummary(record, prev) {
+    if (!record) return;
+
+    // Fill pollutant values into table cells
+    const map = {
+        'lpg-val': record.LPG,
+        'co-val': record.CO,
+        'smoke-val': record.Smoke,
+        'co-mq7-val': record.CO_MQ7,
+        'ch4-val': record.CH4,
+        'co-mq9-val': record.CO_MQ9,
+        'co2-val': record.CO2,
+        'nh3-val': record.NH3,
+        'nox-val': record.NOx,
+        'alcohol-val': record.Alcohol,
+        'benzene-val': record.Benzene,
+        'h2-val': record.H2,
+        'air-val': record.Air,
+        'temp-val': record.temperature,
+        'hum-val': record.humidity
+    };
+    Object.keys(map).forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const v = map[id];
+        const formatted = (v === null || v === undefined || isNaN(v)) ? 'N/A' : Number(v).toFixed(3);
+        // determine corresponding key in record for delta comparison
+        let key = id.replace('-val','');
+        // mapping for temp/hum
+        if (key === 'temp') key = 'temperature';
+        if (key === 'hum') key = 'humidity';
+        let prevVal = null;
+        if (prev) {
+            // tolerate different casings on the previous record
+            if (prev[key] !== undefined) prevVal = prev[key];
+            else if (prev[key.toLowerCase()] !== undefined) prevVal = prev[key.toLowerCase()];
+            else if (prev[key.toUpperCase()] !== undefined) prevVal = prev[key.toUpperCase()];
+            else prevVal = null;
+        }
+        el.innerHTML = formatted + ' ' + deltaHtml(v, prevVal);
+    });
+
+    // Show server-saved timestamp if present
+    const recordedEl = document.getElementById('recorded-at');
+    if (recordedEl) {
+        if (record.timestamp) {
+            try {
+                recordedEl.innerText = new Date(record.timestamp).toLocaleString();
+            } catch (e) {
+                recordedEl.innerText = String(record.timestamp);
+            }
+        } else if (record.timestamp_ms) {
+            // fallback to showing millis value if only timestamp_ms available
+            recordedEl.innerText = 'device_millis:' + record.timestamp_ms;
+        } else {
+            recordedEl.innerText = '—';
+        }
+    }
+
+    // If device provided SD-AQI, prefer that; otherwise compute SD-AQI using configurable scales and multiplier
+    let sdAqiNum = null;
+    if (record.sd_aqi !== undefined && record.sd_aqi !== null && !isNaN(record.sd_aqi)) {
+        sdAqiNum = Number(record.sd_aqi);
+    }
+    // also check common alternative casings
+    if (sdAqiNum === null && record.SD_AQI !== undefined && record.SD_AQI !== null && !isNaN(record.SD_AQI)) {
+        sdAqiNum = Number(record.SD_AQI);
+    }
+
+    // Compute only if not provided by device
+    const scales = {
+        LPG: 0.01, CO: 0.01, Smoke: 0.05, CO_MQ7: 0.01, CH4: 0.01, CO_MQ9: 0.01,
+        CO2: 10, NH3: 10, NOx: 10, Alcohol: 2, Benzene: 5, H2: 0.01, Air: 0.01
+    };
+    const keys = Object.keys(scales);
+    if (sdAqiNum === null) {
+        const normalized = [];
+        keys.forEach(k => {
+            const v = record[k];
+            if (v !== null && v !== undefined && !isNaN(v) && Number(v) > 0) {
+                normalized.push(Number(v) / scales[k]);
+            }
+        });
+
+        let sdAqi = 0;
+        if (normalized.length > 0) {
+            const avg = normalized.reduce((s, x) => s + x, 0) / normalized.length;
+            sdAqi = avg * 6; // multiplier tuned for small-range index; adjust if you have real formula
+        }
+        sdAqiNum = Number(sdAqi);
+    }
+    const sdAqiStr = (sdAqiNum !== null && sdAqiNum !== undefined) ? Number(sdAqiNum).toFixed(2) : '—';
+
+    // Category and color thresholds (tune as needed)
+    // Category and color thresholds (tune as needed) — allow device-provided level
+    let category = 'Unknown';
+    let color = '#6c757d'; // gray
+    const providedLevel = record.sd_aqi_level || record.SD_AQI_level || record.sdAqiLevel;
+    if (providedLevel) {
+        category = providedLevel;
+        // map some common names to colors
+        if (/excellent/i.test(providedLevel)) color = '#28a745';
+        else if (/good/i.test(providedLevel)) color = '#8bc34a';
+        else if (/moderate/i.test(providedLevel)) color = '#ffc107';
+        else if (/poor/i.test(providedLevel)) color = '#ff9800';
+        else if (/hazardous/i.test(providedLevel)) color = '#dc3545';
+    } else if (sdAqiNum !== null && !isNaN(sdAqiNum)) {
+        if (sdAqiNum <= 3) { category = 'Excellent'; color = '#28a745'; }
+        else if (sdAqiNum <= 6) { category = 'Good'; color = '#8bc34a'; }
+        else if (sdAqiNum <= 9) { category = 'Moderate'; color = '#ffc107'; }
+        else if (sdAqiNum <= 12) { category = 'Poor'; color = '#ff9800'; }
+        else { category = 'Hazardous'; color = '#dc3545'; }
+    }
+
+    // Update badge
+    const badge = document.getElementById('sd-aqi-badge');
+    if (badge) {
+        badge.innerText = `SD-AQI: ${sdAqiStr} — ${category}`;
+        badge.style.backgroundColor = color;
+        badge.style.color = '#ffffff';
+    }
+}
+
+function formatVal(v) {
+    if (v === null || v === undefined || isNaN(v)) return 'N/A';
+    return Number(v).toFixed(3);
+}
+
+function deltaHtml(curr, prev) {
+    // curr and prev expected numeric
+    if (curr === null || curr === undefined || isNaN(curr)) return '<span style="color:#6c757d">—</span>';
+    if (prev === null || prev === undefined || isNaN(prev)) return '<span style="color:#6c757d">—</span>';
+    const c = Number(curr);
+    const p = Number(prev);
+    if (c > p) return '<span style="color:#28a745;margin-left:6px">▲</span>';
+    if (c < p) return '<span style="color:#dc3545;margin-left:6px">▼</span>';
+    return '<span style="color:#6c757d;margin-left:6px">—</span>';
 }
 
 // Filter Data Based on User Selection
@@ -124,9 +326,23 @@ function updateMqChart(filteredMqData) {
     const timestamps = limitedData.map(record => new Date(record.timestamp));
     mqChart.data.labels = timestamps;
 
+    function labelToKey(label) {
+        const lower = label.toLowerCase();
+        if (lower === 'temperature') return 'temperature';
+        if (lower === 'humidity') return 'humidity';
+        return label.replace(/ /g, '_');
+    }
+
     mqChart.data.datasets.forEach((dataset) => {
-        const key = dataset.label.replace(/ /g, '_');
-        dataset.data = limitedData.map(record => record[key] || null);
+        const key = labelToKey(dataset.label);
+        dataset.data = limitedData.map(record => {
+            // tolerate different key casings
+            if (record[key] !== undefined) return record[key];
+            // try lowercase key
+            const lk = key.toLowerCase();
+            if (record[lk] !== undefined) return record[lk];
+            return null;
+        });
     });
 
     mqChart.update();
@@ -192,32 +408,76 @@ document.getElementById('resetFilter').addEventListener('click', () => {
 
 
 function renderMqTablePage(data, page) {
+    // Use DataTables: build rows array and populate table. Data should be sorted newest-first
+    if (!mqDataTable) return; // not initialized yet
+
+    const sorted = data.slice().sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    const rows = [];
+    for (let i = 0; i < sorted.length; i++) {
+        const record = sorted[i];
+        const prev = (i + 1 < sorted.length) ? sorted[i + 1] : null; // previous in time
+        const cells = [];
+        // Timestamp (ISO for lookup, but display localized)
+        cells.push(new Date(record.timestamp).toLocaleString());
+        // temperature, humidity
+        cells.push((record.temperature !== null && record.temperature !== undefined) ? Number(record.temperature).toFixed(3) + ' ' + deltaHtml(record.temperature, prev ? prev.temperature : null) : 'N/A');
+        cells.push((record.humidity !== null && record.humidity !== undefined) ? Number(record.humidity).toFixed(3) + ' ' + deltaHtml(record.humidity, prev ? prev.humidity : null) : 'N/A');
+        // MQ sensors
+        const keys = ['LPG','CO','Smoke','CO_MQ7','CH4','CO_MQ9','CO2','NH3','NOx','Alcohol','Benzene','H2','Air'];
+        keys.forEach(k => {
+            const v = (record[k] !== null && record[k] !== undefined) ? Number(record[k]).toFixed(3) : 'N/A';
+            const prevV = prev ? (prev[k] !== undefined ? prev[k] : null) : null;
+            cells.push((v === 'N/A') ? 'N/A' : (v + ' ' + deltaHtml(record[k], prevV)));
+        });
+        // append sd_aqi visible column, then uuid as hidden column
+            const sdCell = (record.sd_aqi !== undefined && record.sd_aqi !== null) ? Number(record.sd_aqi).toFixed(3) : (record.SD_AQI !== undefined && record.SD_AQI !== null ? Number(record.SD_AQI).toFixed(3) : 'N/A');
+            cells.splice(3, 0, sdCell); // insert SD_AQI column after Temperature & Humidity (index 3)
+        cells.push(record.uuid || '');
+        rows.push(cells);
+    }
+
+    // populate datatable
+    mqDataTable.clear();
+    if (rows.length > 0) mqDataTable.rows.add(rows);
+    mqDataTable.draw(false);
+}
+
+// Update DataTable or fallback to manual table population
+function updateMqDataTable(data) {
+    // If DataTable is initialized, let renderMqTablePage handle it
+    if (mqDataTable) {
+        renderMqTablePage(data, 1);
+        return;
+    }
+
+    // Fallback: populate tbody so the user sees rows before DataTable init
     const tableBody = document.getElementById('mq-data-table-body');
+    if (!tableBody) return;
     tableBody.innerHTML = '';
-
-    const startIndex = (page - 1) * mqRecordsPerPage;
-    const endIndex = Math.min(startIndex + mqRecordsPerPage, data.length);
-    const pageData = data.slice(startIndex, endIndex);
-
-    pageData.forEach(record => {
+    const sorted = data.slice().sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    sorted.forEach((record, i) => {
+        const prev = (i + 1 < sorted.length) ? sorted[i + 1] : null;
         const row = document.createElement('tr');
+        const sdCell = (record.sd_aqi !== undefined && record.sd_aqi !== null) ? Number(record.sd_aqi).toFixed(3) : (record.SD_AQI !== undefined && record.SD_AQI !== null ? Number(record.SD_AQI).toFixed(3) : 'N/A');
         row.innerHTML = `
             <td>${new Date(record.timestamp).toLocaleString()}</td>
-            <td>${record.temperature !== null ? record.temperature.toFixed(3) : 'N/A'}</td>
-            <td>${record.humidity !== null ? record.humidity.toFixed(3) : 'N/A'}</td>
-            <td>${record.LPG !== null ? record.LPG.toFixed(3) : 'N/A'}</td>
-            <td>${record.CO !== null ? record.CO.toFixed(3) : 'N/A'}</td>
-            <td>${record.Smoke !== null ? record.Smoke.toFixed(3) : 'N/A'}</td>
-            <td>${record.CO_MQ7 !== null ? record.CO_MQ7.toFixed(3) : 'N/A'}</td>
-            <td>${record.CH4 !== null ? record.CH4.toFixed(3) : 'N/A'}</td>
-            <td>${record.CO_MQ9 !== null ? record.CO_MQ9.toFixed(3) : 'N/A'}</td>
-            <td>${record.CO2 !== null ? record.CO2.toFixed(3) : 'N/A'}</td>
-            <td>${record.NH3 !== null ? record.NH3.toFixed(3) : 'N/A'}</td>
-            <td>${record.NOx !== null ? record.NOx.toFixed(3) : 'N/A'}</td>
-            <td>${record.Alcohol !== null ? record.Alcohol.toFixed(3) : 'N/A'}</td>
-            <td>${record.Benzene !== null ? record.Benzene.toFixed(3) : 'N/A'}</td>
-            <td>${record.H2 !== null ? record.H2.toFixed(3) : 'N/A'}</td>
-            <td>${record.Air !== null ? record.Air.toFixed(3) : 'N/A'}</td>
+            <td>${record.temperature !== null && record.temperature !== undefined ? Number(record.temperature).toFixed(3) + ' ' + deltaHtml(record.temperature, prev ? prev.temperature : null) : 'N/A'}</td>
+            <td>${record.humidity !== null && record.humidity !== undefined ? Number(record.humidity).toFixed(3) + ' ' + deltaHtml(record.humidity, prev ? prev.humidity : null) : 'N/A'}</td>
+            <td>${sdCell}</td>
+            <td>${record.LPG !== null && record.LPG !== undefined ? Number(record.LPG).toFixed(3) + ' ' + deltaHtml(record.LPG, prev ? prev.LPG : null) : 'N/A'}</td>
+            <td>${record.CO !== null && record.CO !== undefined ? Number(record.CO).toFixed(3) + ' ' + deltaHtml(record.CO, prev ? prev.CO : null) : 'N/A'}</td>
+            <td>${record.Smoke !== null && record.Smoke !== undefined ? Number(record.Smoke).toFixed(3) + ' ' + deltaHtml(record.Smoke, prev ? prev.Smoke : null) : 'N/A'}</td>
+            <td>${record.CO_MQ7 !== null && record.CO_MQ7 !== undefined ? Number(record.CO_MQ7).toFixed(3) + ' ' + deltaHtml(record.CO_MQ7, prev ? prev.CO_MQ7 : null) : 'N/A'}</td>
+            <td>${record.CH4 !== null && record.CH4 !== undefined ? Number(record.CH4).toFixed(3) + ' ' + deltaHtml(record.CH4, prev ? prev.CH4 : null) : 'N/A'}</td>
+            <td>${record.CO_MQ9 !== null && record.CO_MQ9 !== undefined ? Number(record.CO_MQ9).toFixed(3) + ' ' + deltaHtml(record.CO_MQ9, prev ? prev.CO_MQ9 : null) : 'N/A'}</td>
+            <td>${record.CO2 !== null && record.CO2 !== undefined ? Number(record.CO2).toFixed(3) + ' ' + deltaHtml(record.CO2, prev ? prev.CO2 : null) : 'N/A'}</td>
+            <td>${record.NH3 !== null && record.NH3 !== undefined ? Number(record.NH3).toFixed(3) + ' ' + deltaHtml(record.NH3, prev ? prev.NH3 : null) : 'N/A'}</td>
+            <td>${record.NOx !== null && record.NOx !== undefined ? Number(record.NOx).toFixed(3) + ' ' + deltaHtml(record.NOx, prev ? prev.NOx : null) : 'N/A'}</td>
+            <td>${record.Alcohol !== null && record.Alcohol !== undefined ? Number(record.Alcohol).toFixed(3) + ' ' + deltaHtml(record.Alcohol, prev ? prev.Alcohol : null) : 'N/A'}</td>
+            <td>${record.Benzene !== null && record.Benzene !== undefined ? Number(record.Benzene).toFixed(3) + ' ' + deltaHtml(record.Benzene, prev ? prev.Benzene : null) : 'N/A'}</td>
+            <td>${record.H2 !== null && record.H2 !== undefined ? Number(record.H2).toFixed(3) + ' ' + deltaHtml(record.H2, prev ? prev.H2 : null) : 'N/A'}</td>
+            <td>${record.Air !== null && record.Air !== undefined ? Number(record.Air).toFixed(3) + ' ' + deltaHtml(record.Air, prev ? prev.Air : null) : 'N/A'}</td>
+            <td class="d-none">${record.uuid || ''}</td>
         `;
         row.addEventListener('click', () => showDetails(record));
         tableBody.appendChild(row);
@@ -325,6 +585,12 @@ function showDetails(record) {
     document.getElementById('modal-h2').innerText = record.H2 !== null ? record.H2.toFixed(3) : 'N/A';
     document.getElementById('modal-air').innerText = record.Air !== null ? record.Air.toFixed(3) : 'N/A';
 
+    // SD_AQI fields (tolerate different casings)
+    const sdVal = (record.sd_aqi !== undefined) ? record.sd_aqi : (record.SD_AQI !== undefined ? record.SD_AQI : null);
+    document.getElementById('modal-sd-aqi').innerText = sdVal !== null ? Number(sdVal).toFixed(3) : 'N/A';
+    const sdLevel = record.sd_aqi_level || record.SD_AQI_level || record.sdAqiLevel || 'N/A';
+    document.getElementById('modal-sd-aqi-level').innerText = sdLevel;
+
     // Show the modal
     modal.show();
 }
@@ -332,3 +598,125 @@ function showDetails(record) {
 
 setInterval(fetchMqData, 1000);
 fetchMqData();
+
+// Initialize DataTable once DOM is ready
+document.addEventListener('DOMContentLoaded', () => {
+    try {
+        mqDataTable = $('#mq-data-table').DataTable({
+            paging: true,
+            pageLength: mqRecordsPerPage,
+            searching: false,
+            info: false,
+            order: [[0, 'desc']],
+            // 17 visible columns + 1 hidden uuid column
+            columns: Array.from({length: 18}, () => ({ searchable: false })),
+            columnDefs: [
+                { targets: 17, visible: false } // hide the uuid column
+            ]
+        });
+
+        // Row click handler to show details for selected row using uuid (stable)
+        $('#mq-data-table tbody').on('click', 'tr', function () {
+            const row = mqDataTable.row(this);
+            const rowData = row.data();
+            if (!rowData) return;
+            const uuid = rowData[17]; // hidden uuid column
+            if (!uuid) return;
+            const rec = lastFilteredData.find(r => r.uuid === uuid);
+            if (rec) showDetails(rec);
+        });
+    } catch (err) {
+        console.warn('DataTable init failed:', err);
+    }
+    // initialize polling controls
+    const pollToggle = document.getElementById('poll-toggle');
+    const pollIntervalInput = document.getElementById('poll-interval');
+    const lastUpdatedEl = document.getElementById('last-updated');
+
+    function startPolling() {
+        stopPolling();
+        pollTimerId = setInterval(fetchMqData, pollIntervalMs);
+        isPolling = true;
+        if (pollToggle) { pollToggle.innerText = 'Pause'; pollToggle.classList.remove('btn-primary'); pollToggle.classList.add('btn-success'); }
+    }
+    function stopPolling() {
+        if (pollTimerId) { clearInterval(pollTimerId); pollTimerId = null; }
+        isPolling = false;
+        if (pollToggle) { pollToggle.innerText = 'Resume'; pollToggle.classList.remove('btn-success'); pollToggle.classList.add('btn-primary'); }
+    }
+
+    if (pollToggle) {
+        pollToggle.addEventListener('click', () => {
+            if (isPolling) stopPolling(); else startPolling();
+        });
+    }
+    if (pollIntervalInput) {
+        pollIntervalInput.addEventListener('change', (e) => {
+            const v = parseInt(e.target.value, 10);
+            if (!isNaN(v) && v >= 200) {
+                pollIntervalMs = v;
+                if (isPolling) startPolling();
+            }
+        });
+    }
+
+    // set up chart options toggles
+    const showTemp = document.getElementById('show-temperature');
+    const showHum = document.getElementById('show-humidity');
+    if (showTemp) showTemp.addEventListener('change', () => {
+        const ds = mqChart.data.datasets.find(d => d.label === 'Temperature');
+        if (ds) ds.hidden = !showTemp.checked;
+        mqChart.update();
+    });
+    if (showHum) showHum.addEventListener('change', () => {
+        const ds = mqChart.data.datasets.find(d => d.label === 'Humidity');
+        if (ds) ds.hidden = !showHum.checked;
+        mqChart.update();
+    });
+
+    // start polling according to initial interval
+    pollIntervalInput.value = pollIntervalMs;
+    startPolling();
+
+    // expose helper to update last-updated stamp
+    window.__updateLastUpdated = (ts) => { if (lastUpdatedEl) lastUpdatedEl.innerText = ts; };
+});
+
+// Compute and render analysis cards
+function computeAndRenderAnalysis(data) {
+    const container = document.getElementById('analysis-container');
+    if (!container) return;
+    // For a small set of keys produce stats: last, avg, min, max
+    const keys = ['Temperature','Humidity','LPG','CO','Smoke','CO2','NH3','NOx','Alcohol','Benzene','SD_AQI'];
+    // compute over last N points (default 50)
+    const N = Math.min(data.length, 50);
+    const recent = data.slice(0, N);
+    container.innerHTML = '';
+    keys.forEach(k => {
+        const values = recent.map(r => {
+            // tolerate casing
+            if (r[k] !== undefined) return Number(r[k]);
+            const lk = k.toLowerCase();
+            if (r[lk] !== undefined) return Number(r[lk]);
+            return null;
+        }).filter(v => v !== null && !isNaN(v));
+        let last = values.length ? values[0] : null;
+        let avg = values.length ? (values.reduce((s,x)=>s+x,0)/values.length) : null;
+        let min = values.length ? Math.min(...values) : null;
+        let max = values.length ? Math.max(...values) : null;
+        const card = document.createElement('div');
+        card.className = 'col-6 col-md-4';
+        card.innerHTML = `
+            <div class="card small">
+                <div class="card-body p-2">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div><strong>${k}</strong></div>
+                        <div class="text-end"><div class="fw-bold">${last!==null?Number(last).toFixed(3):'—'}</div><div class="small text-muted">last</div></div>
+                    </div>
+                    <div class="mt-2 small text-muted">Avg: ${avg!==null?Number(avg).toFixed(3):'—'} • Min: ${min!==null?Number(min).toFixed(3):'—'} • Max: ${max!==null?Number(max).toFixed(3):'—'}</div>
+                </div>
+            </div>
+        `;
+        container.appendChild(card);
+    });
+}
