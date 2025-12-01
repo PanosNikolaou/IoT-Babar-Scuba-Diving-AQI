@@ -348,6 +348,78 @@ function updateMqChart(filteredMqData) {
     mqChart.update();
 }
 
+// Build parameter toggle controls dynamically from the chart datasets
+function buildParameterControls() {
+    const container = document.getElementById('param-checkbox-list');
+    if (!container) return;
+    container.innerHTML = '';
+
+    mqChart.data.datasets.forEach((ds, idx) => {
+        const id = `param-toggle-${idx}`;
+        const storageKey = `mq_param_${String(ds.label).replace(/\s+/g,'_').toLowerCase()}`;
+        const wrapper = document.createElement('div');
+        wrapper.className = 'form-check';
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.className = 'form-check-input';
+        input.id = id;
+        // load saved state from localStorage when available
+        try {
+            const stored = localStorage.getItem(storageKey);
+            if (stored !== null) {
+                input.checked = (stored === 'true');
+                ds.hidden = !input.checked;
+            } else {
+                input.checked = !(ds.hidden === true);
+            }
+        } catch (e) {
+            input.checked = !(ds.hidden === true);
+        }
+        const label = document.createElement('label');
+        label.className = 'form-check-label';
+        label.htmlFor = id;
+        label.innerText = ds.label;
+
+        input.addEventListener('change', () => {
+            ds.hidden = !input.checked;
+            try { localStorage.setItem(storageKey, String(input.checked)); } catch (e) { /* ignore */ }
+            mqChart.update();
+        });
+
+        wrapper.appendChild(input);
+        wrapper.appendChild(label);
+        container.appendChild(wrapper);
+    });
+
+    // select / deselect buttons
+    const selectAll = document.getElementById('select-all-params');
+    const deselectAll = document.getElementById('deselect-all-params');
+    if (selectAll) {
+        selectAll.addEventListener('click', (e) => {
+            e.preventDefault();
+            mqChart.data.datasets.forEach((ds, idx) => {
+                ds.hidden = false;
+                const cb = document.getElementById(`param-toggle-${idx}`);
+                if (cb) cb.checked = true;
+                try { localStorage.setItem(`mq_param_${String(ds.label).replace(/\s+/g,'_').toLowerCase()}`, 'true'); } catch(e) {}
+            });
+            mqChart.update();
+        });
+    }
+    if (deselectAll) {
+        deselectAll.addEventListener('click', (e) => {
+            e.preventDefault();
+            mqChart.data.datasets.forEach((ds, idx) => {
+                ds.hidden = true;
+                const cb = document.getElementById(`param-toggle-${idx}`);
+                if (cb) cb.checked = false;
+                try { localStorage.setItem(`mq_param_${String(ds.label).replace(/\s+/g,'_').toLowerCase()}`, 'false'); } catch(e) {}
+            });
+            mqChart.update();
+        });
+    }
+}
+
 document.getElementById('applyFilter').addEventListener('click', () => {
     const timeFilter = document.getElementById('timeFilter').value;
     const maxDataPoints = parseInt(document.getElementById('maxDataPoints').value, 10) || 50;
@@ -660,19 +732,8 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // set up chart options toggles
-    const showTemp = document.getElementById('show-temperature');
-    const showHum = document.getElementById('show-humidity');
-    if (showTemp) showTemp.addEventListener('change', () => {
-        const ds = mqChart.data.datasets.find(d => d.label === 'Temperature');
-        if (ds) ds.hidden = !showTemp.checked;
-        mqChart.update();
-    });
-    if (showHum) showHum.addEventListener('change', () => {
-        const ds = mqChart.data.datasets.find(d => d.label === 'Humidity');
-        if (ds) ds.hidden = !showHum.checked;
-        mqChart.update();
-    });
+    // build dynamic parameter controls for chart datasets
+    try { buildParameterControls(); } catch (e) { console.warn('buildParameterControls error', e); }
 
     // start polling according to initial interval
     pollIntervalInput.value = pollIntervalMs;

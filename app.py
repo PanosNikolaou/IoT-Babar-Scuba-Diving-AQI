@@ -200,6 +200,49 @@ with app.app_context():
         SENSOR_COLUMNS = set()
         MQ_COLUMNS = set()
 
+    # Backfill uuid for existing rows where it's NULL so frontend can rely on stable ids
+    try:
+        engine = db.get_engine(app)
+        conn = engine.raw_connection()
+        cur = conn.cursor()
+        # sensor_data
+        try:
+            cur.execute("SELECT id FROM sensor_data WHERE uuid IS NULL OR uuid = ''")
+            rows = cur.fetchall()
+            for (rid,) in rows:
+                try:
+                    cur.execute("UPDATE sensor_data SET uuid = ? WHERE id = ?", (str(uuid4()), rid))
+                except Exception:
+                    pass
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        # mq_sensor_data
+        try:
+            cur.execute("SELECT id FROM mq_sensor_data WHERE uuid IS NULL OR uuid = ''")
+            rows = cur.fetchall()
+            for (rid,) in rows:
+                try:
+                    cur.execute("UPDATE mq_sensor_data SET uuid = ? WHERE id = ?", (str(uuid4()), rid))
+                except Exception:
+                    pass
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+    except Exception as e:
+        print('Warning backfilling uuids:', e)
+
 @app.route("/api/data", methods=["POST"])
 @limiter.limit("10 per second")  # Limit to 10 requests per second
 def receive_data():
