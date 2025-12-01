@@ -4,6 +4,7 @@ import threading
 import os
 from datetime import datetime
 from uuid import uuid4
+import traceback
 
 from flask import Flask, request, jsonify, render_template
 from flask_sqlalchemy import SQLAlchemy
@@ -119,7 +120,8 @@ try:
         print('Skipping DB migration in reloader parent process')
 except Exception as e:
     # Non-fatal: log and continue; create_all() will still try to create missing tables
-    print('Migration script failed or not run:', repr(e))
+    print('Migration script failed or not run:')
+    print(traceback.format_exc())
 
 # Create the database tables
 with app.app_context():
@@ -181,7 +183,8 @@ with app.app_context():
             pass
     except Exception as e:
         # Non-fatal: if this fails (e.g., non-sqlite engine), log and continue; new DBs will include the columns.
-        print('Warning ensuring schema columns:', repr(e))
+        print('Warning ensuring schema columns:')
+        print(traceback.format_exc())
     # Determine which columns actually exist in the tables so we can avoid referencing missing columns
     SENSOR_COLUMNS = set()
     MQ_COLUMNS = set()
