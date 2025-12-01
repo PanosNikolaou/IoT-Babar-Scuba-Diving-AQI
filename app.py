@@ -18,6 +18,12 @@ app = Flask(__name__)
 # Database configuration
 # Use the `instance` folder DB to avoid updating the wrong file during migrations/tests
 DB_FILE = os.path.join(os.path.dirname(__file__), 'instance', 'iot_data.db')
+try:
+    # Ensure the instance directory exists so SQLite can create/open the DB file
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+except Exception as _:
+    # non-fatal: if we can't create it here we'll let SQLAlchemy report the error
+    pass
 app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{DB_FILE}"
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
