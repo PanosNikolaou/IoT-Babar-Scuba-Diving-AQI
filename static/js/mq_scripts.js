@@ -66,6 +66,15 @@ document.getElementById('timeFilter').addEventListener('change', (event) => {
     document.getElementById('customDateRange').style.display = activeFilter === 'custom' ? 'block' : 'none';
 });
 
+// Chart-specific filter controls
+const chartTimeFilterEl = document.getElementById('chartTimeFilter');
+if (chartTimeFilterEl) {
+    chartTimeFilterEl.addEventListener('change', (e) => {
+        const v = e.target.value;
+        document.getElementById('chartCustomDateRange').style.display = v === 'custom' ? 'block' : 'none';
+    });
+}
+
 document.getElementById('applyFilter').addEventListener('click', () => {
     fetchMqData(); // Re-fetch data with the selected filter
 });
@@ -212,6 +221,7 @@ async function fetchMqData() {
         }
 
         // Update the chart (chart update function will handle internal ordering/limiting)
+        // Pass the UI-filtered dataset; chart will apply its own chartTimeFilter if set.
         updateMqChart(sortedFiltered);
 
         // Update DataTable with latest filtered (or fallback) data
@@ -275,7 +285,42 @@ function renderMqSummary(record, prev) {
             else if (prev[key.toUpperCase()] !== undefined) prevVal = prev[key.toUpperCase()];
             else prevVal = null;
         }
+        // If immediate previous record didn't provide a value, search the
+        // rest of the loaded dataset for the most recent non-null value
+        // so we can still compute a delta arrow.
+        if ((prevVal === null || prevVal === undefined || isNaN(prevVal)) && Array.isArray(lastFilteredData)) {
+            for (let i = 1; i < lastFilteredData.length; i++) {
+                const r = lastFilteredData[i];
+                let cand = undefined;
+                if (r[key] !== undefined) cand = r[key];
+                else if (r[key.toLowerCase()] !== undefined) cand = r[key.toLowerCase()];
+                else if (r[key.toUpperCase()] !== undefined) cand = r[key.toUpperCase()];
+                if (cand !== undefined && cand !== null && !isNaN(cand)) { prevVal = cand; break; }
+            }
+        }
         el.innerHTML = formatted + ' ' + deltaHtml(v, prevVal);
+        // populate the short description column (newly added in the template)
+        try {
+            const descId = id.replace('-val', '-desc');
+            const descEl = document.getElementById(descId);
+            if (descEl) {
+                const shortTxt = getShortDesc(v, prevVal);
+                descEl.innerText = shortTxt;
+                // provide a per-cell tooltip for clarity
+                const expl = 'Rising = current > previous; Falling = current < previous; Stable = equal; — = no previous value; N/A = missing current value.';
+                descEl.setAttribute('title', expl);
+                descEl.setAttribute('data-bs-toggle', 'tooltip');
+                try {
+                    // initialize Bootstrap tooltip for this element
+                    /* global bootstrap */
+                    new bootstrap.Tooltip(descEl);
+                } catch (err) {
+                    // bootstrap may not be available in some contexts; ignore
+                }
+            }
+        } catch (e) {
+            // ignore missing elements
+        }
     });
 
     // Show server-saved timestamp if present
@@ -360,19 +405,75 @@ function renderMqSummary(record, prev) {
 }
 
 function formatVal(v) {
-    if (v === null || v === undefined || isNaN(v)) return 'N/A';
+    if (v === null || v === undefined) return 'N/A';
+    if (typeof v === 'string' && v.trim() === '') return 'N/A';
+    if (isNaN(Number(v))) return 'N/A';
     return Number(v).toFixed(3);
 }
 
 function deltaHtml(curr, prev) {
     // curr and prev expected numeric
-    if (curr === null || curr === undefined || isNaN(curr)) return '<span style="color:#6c757d">—</span>';
-    if (prev === null || prev === undefined || isNaN(prev)) return '<span style="color:#6c757d">—</span>';
+    if (curr === null || curr === undefined) return '<span style="color:#6c757d">—</span>';
+    if (typeof curr === 'string' && curr.trim() === '') return '<span style="color:#6c757d">—</span>';
+    if (isNaN(Number(curr))) return '<span style="color:#6c757d">—</span>';
+    if (prev === null || prev === undefined) return '<span style="color:#6c757d">—</span>';
+    if (typeof prev === 'string' && prev.trim() === '') return '<span style="color:#6c757d">—</span>';
+    if (isNaN(Number(prev))) return '<span style="color:#6c757d">—</span>';
     const c = Number(curr);
     const p = Number(prev);
     if (c > p) return '<span style="color:#28a745;margin-left:6px">▲</span>';
     if (c < p) return '<span style="color:#dc3545;margin-left:6px">▼</span>';
     return '<span style="color:#6c757d;margin-left:6px">—</span>';
+}
+
+// Return a very short description for a metric based on current and previous values.
+// Values: 'Rising', 'Falling', 'Stable', 'N/A' or '—' when unknown.
+function getShortDesc(curr, prev) {
+    if (curr === null || curr === undefined || isNaN(Number(curr))) return 'N/A';
+    if (prev === null || prev === undefined || isNaN(Number(prev))) return '—';
+    const c = Number(curr);
+    const p = Number(prev);
+    if (c > p) return 'Rising';
+    if (c < p) return 'Falling';
+    return 'Stable';
+}
+
+// Adjust the table container height so it fits the number of displayed rows.
+// displayedRows: number of rows currently visible (e.g. page size or filtered results)
+function adjustTableHeight(displayedRows) {
+    try {
+        const container = document.querySelector('.table-container');
+        const table = document.getElementById('mq-data-table');
+        if (!container || !table) return;
+
+        // Minimal/defaults
+        const minHeight = 80; // px
+        const maxHeight = 900; // px cap to avoid extremely tall pages
+
+        // Try to measure a real row height if present
+        const tbody = table.querySelector('tbody');
+        let rowHeight = 36; // sensible default
+        if (tbody && tbody.firstElementChild) {
+            const r = tbody.firstElementChild.getBoundingClientRect();
+            if (r && r.height > 8) rowHeight = r.height;
+        }
+
+        // Header height (thead)
+        let headerHeight = 0;
+        const thead = table.querySelector('thead');
+        if (thead) {
+            const h = thead.getBoundingClientRect();
+            if (h && h.height > 0) headerHeight = h.height;
+        }
+
+        const total = Math.max(minHeight, Math.min(maxHeight, Math.ceil(displayedRows) * rowHeight + headerHeight + 8));
+        container.style.maxHeight = total + 'px';
+        // When we set exact height, allow the page to scroll instead of inner box
+        container.style.overflowY = 'auto';
+    } catch (e) {
+        // Ignore measurement failures
+        console.warn('adjustTableHeight failed', e);
+    }
 }
 
 // Filter Data Based on User Selection
@@ -403,9 +504,36 @@ function filterDataByCriteria(data) {
 
 
 function updateMqChart(filteredMqData) {
-    //const MAX_DATA_POINTS = 50; // Optional: Limit the data points
+    // Chart-specific time filtering (chartTimeFilter overrides UI timeFilter when set)
     const maxDataPoints = parseInt(document.getElementById('maxDataPoints').value, 10) || 50;
-    const sortedData = filteredMqData.sort((a, b) => parseServerTimestamp(b.timestamp) - parseServerTimestamp(a.timestamp));
+    let chartFiltered = filteredMqData.slice();
+    const chartFilterEl = document.getElementById('chartTimeFilter');
+    const ctf = chartFilterEl ? chartFilterEl.value : 'inherit';
+    if (ctf && ctf !== 'inherit') {
+        const now = new Date();
+        let start = null;
+        let end = now;
+        if (ctf === 'custom') {
+            const s = document.getElementById('chartStartDate').value;
+            const e = document.getElementById('chartEndDate').value;
+            start = s ? new Date(s) : null;
+            end = e ? new Date(e) : now;
+        } else if (ctf === '1hour') {
+            start = new Date(end.getTime() - 60 * 60 * 1000);
+        } else if (ctf === '24hours') {
+            start = new Date(end.getTime() - 24 * 60 * 60 * 1000);
+        } else if (ctf === '7days') {
+            start = new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
+        }
+        if (start) {
+            chartFiltered = chartFiltered.filter(rec => {
+                const t = parseServerTimestamp(rec.timestamp);
+                return t && !isNaN(t.getTime()) && t >= start && t <= end;
+            });
+        }
+    }
+
+    const sortedData = chartFiltered.sort((a, b) => parseServerTimestamp(b.timestamp) - parseServerTimestamp(a.timestamp));
     const limitedData = sortedData.slice(0, maxDataPoints).reverse(); // Get the latest points in chronological order
 
     const timestamps = limitedData.map(record => parseServerTimestamp(record.timestamp));
@@ -615,6 +743,11 @@ function renderMqTablePage(data, page) {
     mqDataTable.clear();
     if (rows.length > 0) mqDataTable.rows.add(rows);
     mqDataTable.draw(false);
+    // Adjust container height to fit the visible rows on the current page
+    try {
+        const visibleRows = Math.min(rows.length, mqRecordsPerPage);
+        adjustTableHeight(visibleRows);
+    } catch (e) { /* ignore */ }
 }
 
 // Update DataTable or fallback to manual table population
@@ -658,6 +791,10 @@ function updateMqDataTable(data) {
         row.addEventListener('click', () => showDetails(record));
         tableBody.appendChild(row);
     });
+    // Adjust container height to fit the number of rows we just populated
+    try {
+        adjustTableHeight(sorted.length);
+    } catch (e) { /* ignore */ }
 }
 
 function renderMqPaginationControls(data) {

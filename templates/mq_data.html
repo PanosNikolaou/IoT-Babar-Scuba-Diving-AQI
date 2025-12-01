@@ -68,20 +68,30 @@
                         <div class="row">
                             <div class="col-md-8">
                                 <table class="table table-sm table-borderless mb-0">
+                                    <thead>
+                                        <tr>
+                                            <th>Pollutant</th>
+                                            <th>Value</th>
+                                            <th>
+                                                Description
+                                                <span tabindex="0" role="button" class="ms-1 text-muted" data-bs-toggle="tooltip" title="Description: one-word summary comparing current and most recent previous measurement. Rising = current > previous; Falling = current < previous; Stable = equal; — = previous value unavailable; N/A = current value missing.">&#9432;</span>
+                                            </th>
+                                        </tr>
+                                    </thead>
                                     <tbody>
-                                    <tr><th>LPG (MQ2)</th><td id="lpg-val">—</td></tr>
-                                    <tr><th>CO (MQ2)</th><td id="co-val">—</td></tr>
-                                    <tr><th>Smoke (MQ2)</th><td id="smoke-val">—</td></tr>
-                                    <tr><th>CO (MQ7)</th><td id="co-mq7-val">—</td></tr>
-                                    <tr><th>CH4 (MQ4)</th><td id="ch4-val">—</td></tr>
-                                    <tr><th>CO (MQ9)</th><td id="co-mq9-val">—</td></tr>
-                                    <tr><th>CO2 (MQ135)</th><td id="co2-val">—</td></tr>
-                                    <tr><th>NH3 (MQ135)</th><td id="nh3-val">—</td></tr>
-                                    <tr><th>NOx (MQ135)</th><td id="nox-val">—</td></tr>
-                                    <tr><th>Alcohol (MQ135)</th><td id="alcohol-val">—</td></tr>
-                                    <tr><th>Benzene (MQ135)</th><td id="benzene-val">—</td></tr>
-                                    <tr><th>H2 (MQ8)</th><td id="h2-val">—</td></tr>
-                                    <tr><th>Air (MQ8)</th><td id="air-val">—</td></tr>
+                                    <tr><th>LPG (MQ2)</th><td id="lpg-val">—</td><td id="lpg-desc">—</td></tr>
+                                    <tr><th>CO (MQ2)</th><td id="co-val">—</td><td id="co-desc">—</td></tr>
+                                    <tr><th>Smoke (MQ2)</th><td id="smoke-val">—</td><td id="smoke-desc">—</td></tr>
+                                    <tr><th>CO (MQ7)</th><td id="co-mq7-val">—</td><td id="co-mq7-desc">—</td></tr>
+                                    <tr><th>CH4 (MQ4)</th><td id="ch4-val">—</td><td id="ch4-desc">—</td></tr>
+                                    <tr><th>CO (MQ9)</th><td id="co-mq9-val">—</td><td id="co-mq9-desc">—</td></tr>
+                                    <tr><th>CO2 (MQ135)</th><td id="co2-val">—</td><td id="co2-desc">—</td></tr>
+                                    <tr><th>NH3 (MQ135)</th><td id="nh3-val">—</td><td id="nh3-desc">—</td></tr>
+                                    <tr><th>NOx (MQ135)</th><td id="nox-val">—</td><td id="nox-desc">—</td></tr>
+                                    <tr><th>Alcohol (MQ135)</th><td id="alcohol-val">—</td><td id="alcohol-desc">—</td></tr>
+                                    <tr><th>Benzene (MQ135)</th><td id="benzene-val">—</td><td id="benzene-desc">—</td></tr>
+                                    <tr><th>H2 (MQ8)</th><td id="h2-val">—</td><td id="h2-desc">—</td></tr>
+                                    <tr><th>Air (MQ8)</th><td id="air-val">—</td><td id="air-desc">—</td></tr>
                                     </tbody>
                                 </table>
                             </div>
@@ -151,6 +161,28 @@
                                     <label for="maxDataPoints" class="form-label">Max Data Points</label>
                                     <input type="number" id="maxDataPoints" class="form-control form-control-sm"
                                            value="50" min="1">
+                                </div>
+                                <!-- Chart Time Filter -->
+                                <div class="mb-3">
+                                    <label for="chartTimeFilter" class="form-label">Chart Time Range (overrides Time Range)</label>
+                                    <select id="chartTimeFilter" class="form-select form-select-sm">
+                                        <option value="inherit">Use Time Range</option>
+                                        <option value="1hour">Last 1 Hour</option>
+                                        <option value="24hours">Last 24 Hours</option>
+                                        <option value="7days">Last 7 Days</option>
+                                        <option value="custom">Custom Range</option>
+                                    </select>
+                                </div>
+                                <div id="chartCustomDateRange" style="display: none;">
+                                    <div class="mb-3">
+                                        <label for="chartStartDate" class="form-label">Chart Start Date</label>
+                                        <input type="datetime-local" id="chartStartDate"
+                                               class="form-control form-control-sm">
+                                    </div>
+                                    <div class="mb-3">
+                                        <label for="chartEndDate" class="form-label">Chart End Date</label>
+                                        <input type="datetime-local" id="chartEndDate" class="form-control form-control-sm">
+                                    </div>
                                 </div>
                             </div>
                             <div class="modal-footer">
