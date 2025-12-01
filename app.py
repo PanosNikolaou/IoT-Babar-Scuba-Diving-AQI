@@ -209,45 +209,54 @@ with app.app_context():
     # Backfill uuid for existing rows where it's NULL so frontend can rely on stable ids
     try:
         engine = db.get_engine(app)
-        conn = engine.raw_connection()
-        cur = conn.cursor()
-        # sensor_data
-        try:
-            cur.execute("SELECT id FROM sensor_data WHERE uuid IS NULL OR uuid = ''")
-            rows = cur.fetchall()
-            for (rid,) in rows:
-                try:
+        from sqlalchemy import inspect
+        inspector = inspect(engine)
+        tables = inspector.get_table_names()
+
+        if 'sensor_data' in tables:
+            conn = engine.raw_connection()
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT id FROM sensor_data WHERE uuid IS NULL OR uuid = ''")
+                rows = cur.fetchall()
+                for (rid,) in rows:
                     cur.execute("UPDATE sensor_data SET uuid = ? WHERE id = ?", (str(uuid4()), rid))
-                except Exception:
-                    pass
-            conn.commit()
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        # mq_sensor_data
-        try:
-            cur.execute("SELECT id FROM mq_sensor_data WHERE uuid IS NULL OR uuid = ''")
-            rows = cur.fetchall()
-            for (rid,) in rows:
+                conn.commit()
+            except Exception as inner_e:
                 try:
-                    cur.execute("UPDATE mq_sensor_data SET uuid = ? WHERE id = ?", (str(uuid4()), rid))
+                    conn.rollback()
                 except Exception:
                     pass
-            conn.commit()
-        except Exception:
+            finally:
+                try:
+                    cur.close()
+                    conn.close()
+                except Exception:
+                    pass
+
+        if 'mq_sensor_data' in tables:
+            conn = engine.raw_connection()
+            cur = conn.cursor()
             try:
-                conn.rollback()
-            except Exception:
-                pass
-        try:
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
+                cur.execute("SELECT id FROM mq_sensor_data WHERE uuid IS NULL OR uuid = ''")
+                rows = cur.fetchall()
+                for (rid,) in rows:
+                    cur.execute("UPDATE mq_sensor_data SET uuid = ? WHERE id = ?", (str(uuid4()), rid))
+                conn.commit()
+            except Exception as inner_e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    cur.close()
+                    conn.close()
+                except Exception:
+                    pass
+
     except Exception as e:
-        print('Warning backfilling uuids:', e)
+        print('Warning backfilling uuids: %r' % (e,))
 
 @app.route("/api/data", methods=["POST"])
 @limiter.limit("10 per second")  # Limit to 10 requests per second
