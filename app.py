@@ -18,7 +18,8 @@ app = Flask(__name__)
 
 # Database configuration
 # Use the `instance` folder DB to avoid updating the wrong file during migrations/tests
-DB_FILE = os.path.join(os.path.dirname(__file__), 'instance', 'iot_data.db')
+# Ensure an absolute path so Flask/SQLAlchemy do not resolve relative paths inconsistently
+DB_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), 'instance', 'iot_data.db'))
 try:
     # Ensure the instance directory exists so SQLite can create/open the DB file
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
@@ -125,12 +126,26 @@ except Exception as e:
 
 # Create the database tables
 with app.app_context():
+    # Debug: print DB path and access before creating tables
+    try:
+        print('DB_FILE =', DB_FILE)
+        print('abs path =', os.path.abspath(DB_FILE))
+        print('exists =', os.path.exists(DB_FILE))
+        print('dir exists =', os.path.exists(os.path.dirname(DB_FILE)), 'dir perms =', oct(os.stat(os.path.dirname(DB_FILE)).st_mode & 0o777))
+        print('file perms =', oct(os.stat(DB_FILE).st_mode & 0o777) if os.path.exists(DB_FILE) else 'n/a')
+        print('SQLALCHEMY_DATABASE_URI =', app.config.get('SQLALCHEMY_DATABASE_URI'))
+        try:
+            print('db.engine.url =', db.engine.url)
+        except Exception:
+            print('db.engine.url: not available yet')
+    except Exception as _:
+        pass
     db.create_all()
 
     # Ensure the uuid, sd_aqi and sd_aqi_level columns exist in existing SQLite tables; if not, add them.
     # Use a raw sqlite connection for robustness and commit immediately.
     try:
-        engine = db.get_engine(app)
+        engine = db.engine
         # table_names() is deprecated in newer SQLAlchemy; use inspector when available
         from sqlalchemy import inspect
         inspector = inspect(engine)
@@ -189,7 +204,7 @@ with app.app_context():
     SENSOR_COLUMNS = set()
     MQ_COLUMNS = set()
     try:
-        engine = db.get_engine(app)
+        engine = db.engine
         conn = engine.raw_connection()
         cur = conn.cursor()
         def cols(table):
@@ -211,7 +226,7 @@ with app.app_context():
 
     # Backfill uuid for existing rows where it's NULL so frontend can rely on stable ids
     try:
-        engine = db.get_engine(app)
+        engine = db.engine
         from sqlalchemy import inspect
         inspector = inspect(engine)
         tables = inspector.get_table_names()
